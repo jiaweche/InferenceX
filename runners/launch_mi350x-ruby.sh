@@ -125,6 +125,7 @@ container_name="inferencex-${USER}-${run_tag,,}"
     printf 'image=%s\n' "$IMAGE"
     printf 'image_id=%s\n' "$(docker image inspect "$IMAGE" --format '{{.Id}}')"
     printf 'model=%s\n' "$MODEL"
+    printf 'model_revision=%s\n' "${MODEL_REVISION:-}"
     printf 'host_model_path=%s\n' "$host_model_path"
     printf 'benchmark_script=%s\n' "$benchmark_script"
     printf 'result_filename=%s\n' "$RESULT_FILENAME"
@@ -141,7 +142,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 env_names=(
-    MODEL MODEL_PREFIX MODEL_PATH IMAGE PRECISION FRAMEWORK EXP_NAME
+    MODEL MODEL_REVISION MODEL_PREFIX MODEL_PATH IMAGE PRECISION FRAMEWORK EXP_NAME
     TP PP_SIZE DCP_SIZE PCP_SIZE EP_SIZE DP_SIZE DP_ATTENTION CONC
     KV_OFFLOADING KV_OFFLOAD_BACKEND KV_OFFLOAD_BACKEND_METADATA
     TOTAL_CPU_DRAM_GB DURATION SPEC_DECODING

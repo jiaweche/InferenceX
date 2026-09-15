@@ -12,10 +12,14 @@ require_agentic_kv_offload_none
 export GPU_COUNT="$TP"
 
 # Complete/resume partial downloads instead of trusting nonempty directories.
+MODEL_DOWNLOAD_ARGS=("$MODEL")
+if [[ -n "${MODEL_REVISION:-}" ]]; then
+    MODEL_DOWNLOAD_ARGS+=(--revision "$MODEL_REVISION")
+fi
 if [[ -n "${MODEL_PATH:-}" && "$MODEL_PATH" != "$MODEL" ]]; then
-    hf download "$MODEL" --local-dir "$MODEL_PATH"
+    hf download "${MODEL_DOWNLOAD_ARGS[@]}" --local-dir "$MODEL_PATH"
 else
-    hf download "$MODEL"
+    hf download "${MODEL_DOWNLOAD_ARGS[@]}"
     export MODEL_PATH="$MODEL"
 fi
 
