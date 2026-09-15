@@ -14,6 +14,24 @@ The end-to-end objective is AgentX serving performance. Kernel or
 microbenchmark speedups are necessary evidence, but they are not sufficient to
 ship the integration.
 
+### 1.1 Execution plan index
+
+This file is the master plan. Keep focused implementation details in linked
+child plans and roll their final revisions, evidence, and decisions back into
+this file.
+
+Current child plan:
+
+- [Pooled AITER workspace and explicit teardown](./DSV41_FLASH_MEGAMOE_POOLED_AITER_WORKSPACE.md)
+
+Validated continuation evidence:
+
+- [Ruby handoff and measured shape/A-B results](./DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md)
+
+The successor child, created only after the pooled-workspace gates pass, is
+`plans/DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md`. It will own the prefill-only
+vLLM adapter and matched serving A/B.
+
 ## 2. Branch and source baseline
 
 The feature branch is:

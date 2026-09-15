@@ -17,6 +17,18 @@ Guidance for AI agents working with InferenceX.
 - Commit subjects use conventional English style, while commit bodies include the Chinese translation. Contributor-facing docs use English as the source version and ship with a synchronized `_zh.md` page and language switcher.
 - Follow the nearest existing pattern. Python uses typed signatures and strict Pydantic schemas. YAML uses kebab-case fields. Shared benchmark Bash behavior belongs in `benchmark_lib.sh`, with parameters passed through environment variables.
 
+## Ruby cluster workspace and persistence
+
+Apply these rules on Ruby workers whose hostnames match `cv350-rck-*`:
+
+- Use `/scratch/$USER/` for active worktrees, framework builds, model checkpoints, Docker build contexts, caches, and runtime files. For this branch, the InferenceX worktree is `/scratch/$USER/inferencex-dsv41flash/repo-continuation`, and related AITER/MoRI/vLLM work belongs under `/scratch/$USER/dsv41-megamoe/`.
+- Treat all of `/scratch` as allocation-local working storage. Git does not preserve the directory itself; only committed and pushed repository content survives loss of the worker.
+- Store durable investigation artifacts under `/home/$USER/<project>-validation-<YYYYMMDD>/`. This project uses `/home/$USER/dsv41-megamoe-validation-20260915/` for logs, JSON/JSONL captures, summaries, route corpora, patches, checksums, and command receipts.
+- Keep large checkpoints, image layers, compiler caches, and disposable build products on `/scratch`, not in `/home` or Git.
+- Before releasing an allocation, copy required evidence from `/scratch` to the durable `/home` artifact root, verify the copies, then commit and push all source and plan changes.
+- Put branch execution plans in the repository's `plans/` directory. For this project, [`plans/DSV41_FLASH_MEGAMOE_AGENTX.md`](plans/DSV41_FLASH_MEGAMOE_AGENTX.md) is the master plan; focused next-step plans link back to it and name their successor step.
+- Do not use a home-directory note as the only copy of a plan that should survive in branch history.
+
 ## Test quality
 
 **The one rule: a test must exercise the real implementation with concrete inputs and assert on what it computes, returns, writes, or raises. A test that inspects the code, the repo, or a config file instead of running behavior is not a test and must be deleted.** These rules are mandatory for every test added, modified, or reviewed in this repository. When in doubt, delete the test.
