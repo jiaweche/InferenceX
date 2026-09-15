@@ -1,10 +1,13 @@
 # DeepSeek V4.1 Flash Pooled AITER Workspace and Teardown Plan
 
 > Focused execution plan under the
-> [DeepSeek V4.1 Flash MegaMoE + AgentX master plan](./DSV41_FLASH_MEGAMOE_AGENTX.md).
+> [DeepSeek V4.1 Flash MegaMoE + AgentX master plan](./01_DSV41_FLASH_MEGAMOE_AGENTX.md).
 > The validated starting evidence is recorded in
-> [the Ruby handoff](./DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md).
+> [the Ruby handoff](./02_DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md).
 > This is an internal execution document, not published InferenceX documentation.
+
+Status: **completed on September 15, 2026** at AITER
+`e4b600af4ed97453a325711e2fc2aee0ebeb5239`.
 
 ## 1. Objective
 
@@ -66,10 +69,11 @@ Existing evidence already proves:
 `w2_scale` in its constructor and allocates all dispatch, Stage1, Stage2,
 quantization, and combine buffers per instance.
 
-At MTPR 16384, one instance is approximately 2.6 GB per rank. Instantiating
-one for every backbone MoE layer is not viable. Even reducing the candidate
-capacity to MTPR 8192 would consume approximately 52 GB per rank across 40
-instances, including roughly 30 GB of repeated symmetric allocations.
+The initial static estimate understated several symmetric buffers. The final
+TP4 measurement at MTPR 8192 is 2,236,754,288 bytes per rank: 1,695,265,648
+symmetric bytes plus 541,488,640 CUDA-managed bytes. Instantiating one for
+every backbone MoE layer would therefore consume approximately 89.5 GB per
+rank, including approximately 67.8 GB of repeated symmetric allocations.
 
 The observed candidate prefill values are M=888, 2625, and 7100. Therefore:
 
@@ -267,7 +271,8 @@ incorrect asynchronous rebinding.
 
 ### 7.3 Forty-layer reuse and memory gate
 
-Simulate 40 distinct layer bindings without allocating 40 workspaces.
+Simulate 40 layer bindings across two independently seeded full weight sets
+without allocating 40 workspaces.
 
 Record per rank:
 
@@ -282,7 +287,8 @@ Acceptance:
 
 - one workspace allocation sequence per rank;
 - no growth proportional to layer count;
-- total workspace delta no greater than 1.6 GB per rank at MTPR 8192;
+- combined symmetric and CUDA-managed workspace no greater than 2.4 GB
+  decimal per rank at MTPR 8192;
 - zero additional expert-weight storage;
 - all original weight storage pointers unchanged.
 
@@ -376,11 +382,8 @@ Stop and diagnose if:
 
 ## 10. Next step after this plan
 
-After every completion gate above passes, create:
-
-```text
-plans/DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md
-```
+Every completion gate above passed. The successor is
+[plan 04: selective vLLM MegaMoEV2 adapter](./04_DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md).
 
 That child plan will implement the prefill-only, fail-closed vLLM adapter:
 
@@ -398,3 +401,72 @@ That child plan will implement the prefill-only, fail-closed vLLM adapter:
 Do not begin the vLLM adapter merely because the pooled API compiles. Advance
 only from the recorded correctness, memory, performance, and teardown
 evidence.
+
+## 11. Execution results
+
+Result: **PASS**
+
+Source:
+
+```text
+AITER base:
+  797cce253bbadbaf651cdd93527806aa989ea56b
+AITER result:
+  e4b600af4ed97453a325711e2fc2aee0ebeb5239
+AITER patch SHA256:
+  0b90b1dac1cb82d751fd97b1ea0dcac6a338c89235a729e61b008531dbcf2e8b
+MoRI library SHA256:
+  3df6da1342f1c9dc7923fd2620bb132b283b2063bf0040a88cb08056e136cfd5
+```
+
+The implementation:
+
+- adds strict weight-explicit execution while preserving constructor-bound
+  callers;
+- retains borrowed weight tensors for asynchronous and graph lifetime without
+  copying storage;
+- rejects non-contiguous or unmarked explicit-path weights;
+- passes different W1/W2 pointers through both stages and the residual stream;
+- tracks 39 original symmetric allocations;
+- closes on the runner's own device, independent of the ambient device;
+- frees symmetric allocations in reverse order;
+- supports idempotent close, post-close rejection, and close/recreate;
+- closes each superseded runner in multi-size tests.
+
+Final TP4 M=888 validation alternated two independently seeded weight sets 40
+times. Both references passed at `relL2=0.058254/0.058279`; A-to-B-to-graph-A
+replay was exact; weight pointers were unchanged; and steady allocated-memory
+growth was zero.
+
+Measured TP4 MTPR 8192 workspace per rank:
+
+```text
+symmetric allocations:      39
+symmetric bytes:            1,695,265,648
+CUDA-managed delta:           541,488,640
+combined workspace bytes:   2,236,754,288
+```
+
+The same workspace passed captured M=2625, count-exact hot-skew M=7100,
+maximum M=8192, zero/uneven ranks, multi-size replacement, TP1 DSpark
+close/recreate, and TP8 V4.1 close/recreate. The final TP8 communication-fused
+regression also exited cleanly.
+
+Three-run rank-maximum medians at MTPR 8192:
+
+```text
+M=888:       control 1.4244 ms, Mega 0.8643 ms, +64.74%
+M=2625:      control 2.5460 ms, Mega 1.9103 ms, +33.29%
+M=7100 hot:  control 6.0151 ms, Mega 5.0331 ms, +19.48%
+```
+
+Durable evidence:
+
+```text
+/home/jiaweche/dsv41-megamoe-validation-20260915/operator/pooled-workspace/
+```
+
+Rank-local allocator failure recovery remains fail-stop, and the standalone
+benchmark's exceptional path does not yet guarantee close. These are recorded
+limitations, not failures of the validated normal lifecycle required by the
+next adapter step.

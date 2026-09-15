@@ -26,7 +26,7 @@ Apply these rules on Ruby workers whose hostnames match `cv350-rck-*`:
 - Store durable investigation artifacts under `/home/$USER/<project>-validation-<YYYYMMDD>/`. This project uses `/home/$USER/dsv41-megamoe-validation-20260915/` for logs, JSON/JSONL captures, summaries, route corpora, patches, checksums, and command receipts.
 - Keep large checkpoints, image layers, compiler caches, and disposable build products on `/scratch`, not in `/home` or Git.
 - Before releasing an allocation, copy required evidence from `/scratch` to the durable `/home` artifact root, verify the copies, then commit and push all source and plan changes.
-- Put branch execution plans in the repository's `plans/` directory. For this project, [`plans/DSV41_FLASH_MEGAMOE_AGENTX.md`](plans/DSV41_FLASH_MEGAMOE_AGENTX.md) is the master plan; focused next-step plans link back to it and name their successor step.
+- Put branch execution plans in the repository's `plans/` directory and prefix them with two-digit execution indexes. For this project, [`plans/01_DSV41_FLASH_MEGAMOE_AGENTX.md`](plans/01_DSV41_FLASH_MEGAMOE_AGENTX.md) is the master plan; focused next-step plans link back to it and name their indexed successor step.
 - Do not use a home-directory note as the only copy of a plan that should survive in branch history.
 
 ## Test quality

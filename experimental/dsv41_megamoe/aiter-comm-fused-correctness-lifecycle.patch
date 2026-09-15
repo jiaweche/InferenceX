@@ -62,8 +62,594 @@ index e9a0e0b..1df7162 100644
 +            runner.close()
 +        self.instances.clear()
 +
+diff --git a/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py b/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
+index f7f1ed3..2ede91a 100644
+--- a/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
++++ b/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
+@@ -410,0 +411,2 @@ class FlyDSLDispatchGroupMajorOp:
++        self._closed = False
++        self._owned_symmetric_tensors = []
+@@ -438,0 +441,2 @@ class FlyDSLDispatchGroupMajorOp:
++        label = f"{type(self).__name__}[{len(self._owned_symmetric_tensors)}]"
++        self._owned_symmetric_tensors.append((label, t))
+@@ -560,0 +565,31 @@ class FlyDSLDispatchGroupMajorOp:
++    @property
++    def symmetric_allocation_count(self):
++        return len(self._owned_symmetric_tensors)
++
++    @property
++    def symmetric_allocation_nbytes(self):
++        return sum(tensor.nbytes for _, tensor in self._owned_symmetric_tensors)
++
++    def close(self):
++        if self._closed and not self._owned_symmetric_tensors:
++            return
++        self._closed = True
++        with torch.cuda.device(self._dev):
++            torch.cuda.synchronize(self._dev)
++            ms.shmem_barrier_all()
++            for name, value in tuple(vars(self).items()):
++                if name == "_owned_symmetric_tensors":
++                    continue
++                if isinstance(value, torch.Tensor):
++                    setattr(self, name, None)
++            while self._owned_symmetric_tensors:
++                label, tensor = self._owned_symmetric_tensors[-1]
++                try:
++                    ms.shmem_free(tensor.data_ptr())
++                except Exception as error:
++                    raise RuntimeError(
++                        f"failed to free {label} ({tensor.nbytes} bytes)"
++                    ) from error
++                self._owned_symmetric_tensors.pop()
++            torch.cuda.synchronize(self._dev)
++            ms.shmem_barrier_all()
+@@ -562 +596,0 @@ class FlyDSLDispatchGroupMajorOp:
+-class FlyDSLDispatchCombineIntraNodeOp:
+@@ -563,0 +598 @@ class FlyDSLDispatchCombineIntraNodeOp:
++class FlyDSLDispatchCombineIntraNodeOp:
+@@ -569,0 +605,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
++        self._closed = False
++        self._owned_symmetric_tensors = []
++        self._gm = None
++        self._initialize(config)
++
++    def _initialize(self, config):
+@@ -644 +684,0 @@ class FlyDSLDispatchCombineIntraNodeOp:
+-        self._gm = None
+@@ -671,0 +712,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
++    def _sym(self, shape, dtype):
++        tensor = mori_shmem_create_tensor(shape, dtype)
++        label = f"{type(self).__name__}[{len(self._owned_symmetric_tensors)}]"
++        self._owned_symmetric_tensors.append((label, tensor))
++        return tensor
++
+@@ -696,3 +742,3 @@ class FlyDSLDispatchCombineIntraNodeOp:
+-        self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
+-        self.shmem_disp_out_wts = mori_shmem_create_tensor((mr * k,), torch.float32)
+-        self.shmem_disp_out_idx = mori_shmem_create_tensor((mr * k,), torch.int32)
++        self.shmem_disp_out_tok = self._sym((tok_i16_mr,), torch.int16)
++        self.shmem_disp_out_wts = self._sym((mr * k,), torch.float32)
++        self.shmem_disp_out_idx = self._sym((mr * k,), torch.int32)
+@@ -700,13 +746,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
+-        self.shmem_out_scales = mori_shmem_create_tensor((scale_total,), torch.int8)
+-        self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
+-        self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
+-        self.shmem_tok_id_to_src = mori_shmem_create_tensor((mr,), torch.int32)
+-        self.shmem_comb_inp_tok = mori_shmem_create_tensor(
+-            (tok_i16_mr_worst,), torch.int16
+-        )
+-        self.shmem_comb_inp_wts = mori_shmem_create_tensor(
+-            (mr_worst * k,), torch.float32
+-        )
+-        self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
+-        self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
+-        self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
++        self.shmem_out_scales = self._sym((scale_total,), torch.int8)
++        self.shmem_tok_off = self._sym((1,), torch.int32)
++        self.shmem_recv_tok_num = self._sym((npes,), torch.int32)
++        self.shmem_tok_id_to_src = self._sym((mr,), torch.int32)
++        self.shmem_comb_inp_tok = self._sym((tok_i16_mr_worst,), torch.int16)
++        self.shmem_comb_inp_wts = self._sym((mr_worst * k,), torch.float32)
++        self.shmem_comb_out_tok = self._sym((tok_i16_mt,), torch.int16)
++        self.shmem_comb_out_wts = self._sym((mt * k,), torch.float32)
++        self.shmem_xdev_bar_mem = self._sym((npes,), torch.int64)
+@@ -751,0 +794,56 @@ class FlyDSLDispatchCombineIntraNodeOp:
++    @property
++    def symmetric_allocation_count(self):
++        child_count = self._gm.symmetric_allocation_count if self._gm is not None else 0
++        return len(self._owned_symmetric_tensors) + child_count
++
++    @property
++    def symmetric_allocation_nbytes(self):
++        child_nbytes = (
++            self._gm.symmetric_allocation_nbytes if self._gm is not None else 0
++        )
++        return (
++            sum(tensor.nbytes for _, tensor in self._owned_symmetric_tensors)
++            + child_nbytes
++        )
++
++    def close(self):
++        child_open = self._gm is not None and (
++            not self._gm._closed or bool(self._gm._owned_symmetric_tensors)
++        )
++        if self._closed and not self._owned_symmetric_tensors and not child_open:
++            return
++        self._closed = True
++        with torch.cuda.device(self._dev):
++            torch.cuda.synchronize(self._dev)
++            ms.shmem_barrier_all()
++            if self._gm is not None:
++                self._gm.close()
++                self._gm = None
++            for name, value in tuple(vars(self).items()):
++                if name == "_owned_symmetric_tensors":
++                    continue
++                if isinstance(value, torch.Tensor) or name.startswith(
++                    ("_p2p_", "_fx_")
++                ):
++                    setattr(self, name, None)
++            for cache_name in (
++                "_disp_jit_cache",
++                "_disp_compiled_cache",
++                "_comb_jit_cache",
++                "_comb_compiled_cache",
++            ):
++                cache = getattr(self, cache_name, None)
++                if cache is not None:
++                    cache.clear()
++            while self._owned_symmetric_tensors:
++                label, tensor = self._owned_symmetric_tensors[-1]
++                try:
++                    ms.shmem_free(tensor.data_ptr())
++                except Exception as error:
++                    raise RuntimeError(
++                        f"failed to free {label} ({tensor.nbytes} bytes)"
++                    ) from error
++                self._owned_symmetric_tensors.pop()
++            torch.cuda.synchronize(self._dev)
++            ms.shmem_barrier_all()
++
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
+index 422260e..367714b 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
+@@ -70,0 +71,2 @@ class MegaMoEV2:
++        self._closed = False
++        self._borrowed_weight_refs = {}
+@@ -71,0 +74,14 @@ class MegaMoEV2:
++        bound_weights = tuple(
++            weight if weight.is_contiguous() else weight.contiguous()
++            for weight in (w1, w1_scale, w2, w2_scale)
++        )
++        self._validate_weights(*bound_weights, require_layout_marker=False)
++        (
++            self._bound_w1,
++            self._bound_w1_scale,
++            self._bound_w2,
++            self._bound_w2_scale,
++        ) = bound_weights
++        # Preserve the public attributes used by existing callers.
++        self.w2 = self._bound_w2
++        self.w2_scale = self._bound_w2_scale
+@@ -92,3 +108 @@ class MegaMoEV2:
+-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
+-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+-        self._build_fused_stage1(w1, w1_scale)
++        self._build_fused_stage1(self._bound_w1, self._bound_w1_scale)
+@@ -98,0 +113,83 @@ class MegaMoEV2:
++    def _require_open(self):
++        if self._closed:
++            raise RuntimeError("MegaMoEV2 is closed")
++
++    def _validate_weight_tensor(
++        self,
++        name,
++        tensor,
++        expected_numel,
++        *,
++        require_layout_marker,
++    ):
++        if tensor.device != self.dev:
++            raise ValueError(
++                f"{name} must be on {self.dev}, got {tensor.device}"
++            )
++        if not tensor.is_contiguous():
++            raise ValueError(
++                f"{name} must be contiguous; pooled execution never copies weights"
++            )
++        if tensor.element_size() != 1:
++            raise ValueError(
++                f"{name} must use a one-byte packed dtype, got {tensor.dtype}"
++            )
++        if tensor.numel() != expected_numel:
++            raise ValueError(
++                f"{name} has {tensor.numel()} elements, expected {expected_numel}"
++            )
++        if name in ("w1", "w2") and tensor.dtype not in (
++            torch.float4_e2m1fn_x2,
++            torch.uint8,
++        ):
++            raise ValueError(f"{name} has unsupported packed dtype {tensor.dtype}")
++        if name in ("w1", "w2"):
++            if hasattr(tensor, "is_shuffled") and tensor.is_shuffled is not True:
++                raise ValueError(f"{name} has an invalid AITER shuffle marker")
++            if (
++                require_layout_marker
++                and getattr(tensor, "is_shuffled", False) is not True
++            ):
++                raise ValueError(
++                    f"{name} must use the shuffled AITER A16W4 layout"
++                )
++
++    def _validate_weights(
++        self,
++        w1,
++        w1_scale,
++        w2,
++        w2_scale,
++        *,
++        require_layout_marker,
++    ):
++        self._validate_weight_tensor(
++            "w1",
++            w1,
++            self.epr * 2 * self.inter_dim * (self.model_dim // 2),
++            require_layout_marker=require_layout_marker,
++        )
++        self._validate_weight_tensor(
++            "w1_scale",
++            w1_scale,
++            self.epr * 2 * self.inter_dim * (self.model_dim // 32),
++            require_layout_marker=require_layout_marker,
++        )
++        self._validate_weight_tensor(
++            "w2",
++            w2,
++            self.epr * self.model_dim * (self.inter_dim // 2),
++            require_layout_marker=require_layout_marker,
++        )
++        self._validate_weight_tensor(
++            "w2_scale",
++            w2_scale,
++            self.epr * self.model_dim * (self.inter_dim // 32),
++            require_layout_marker=require_layout_marker,
++        )
++
++    def _retain_borrowed_weights(self, weights):
++        for tensor in weights:
++            key = (tensor.data_ptr(), tensor.numel(), tensor.dtype)
++            self._borrowed_weight_refs[key] = tensor
++
+@@ -100,0 +198 @@ class MegaMoEV2:
++        self._require_open()
+@@ -522,0 +621,2 @@ class MegaMoEV2:
++        w1=None,
++        w1_scale=None,
+@@ -531,0 +632,4 @@ class MegaMoEV2:
++        if w1 is None:
++            w1 = self._bound_w1
++        if w1_scale is None:
++            w1_scale = self._bound_w1_scale
+@@ -571 +675 @@ class MegaMoEV2:
+-            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
++            self._s1_out, self._s1_rx, w1.view(torch.uint8), self._s1_scale_i32, w1_scale.view(torch.uint8),
+@@ -643,0 +748,4 @@ class MegaMoEV2:
++        w1,
++        w1_scale,
++        w2,
++        w2_scale,
+@@ -656,0 +765,2 @@ class MegaMoEV2:
++            w1,
++            w1_scale,
+@@ -661 +771,8 @@ class MegaMoEV2:
+-        return self._run_stage2(run_tokens, stream, slice_output, config)
++        return self._run_stage2(
++            run_tokens,
++            stream,
++            slice_output,
++            config,
++            w2,
++            w2_scale,
++        )
+@@ -663 +780,13 @@ class MegaMoEV2:
+-    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
++    def _run_stage2(
++        self,
++        run_tokens,
++        stream,
++        slice_output,
++        config: MegaMoEConfig,
++        w2=None,
++        w2_scale=None,
++    ):
++        if w2 is None:
++            w2 = self._bound_w2
++        if w2_scale is None:
++            w2_scale = self._bound_w2_scale
+@@ -666 +795,6 @@ class MegaMoEV2:
+-                run_tokens, config, stream, slice_output
++                run_tokens,
++                config,
++                stream,
++                slice_output,
++                w2,
++                w2_scale,
+@@ -668 +802,7 @@ class MegaMoEV2:
+-        ret = self._run_fused_stage2(run_tokens, config, stream)
++        ret = self._run_fused_stage2(
++            run_tokens,
++            config,
++            stream,
++            w2=w2,
++            w2_scale=w2_scale,
++        )
+@@ -684 +824,22 @@ class MegaMoEV2:
+-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
++    def _forward_with_weights(
++        self,
++        x_bf16,
++        wts,
++        topk_ids,
++        w1,
++        w1_scale,
++        w2,
++        w2_scale,
++        *,
++        require_layout_marker,
++        stream=None,
++        slice_output=True,
++    ):
++        self._require_open()
++        self._validate_weights(
++            w1,
++            w1_scale,
++            w2,
++            w2_scale,
++            require_layout_marker=require_layout_marker,
++        )
+@@ -689,0 +851,4 @@ class MegaMoEV2:
++        if tuple(x_bf16.shape) != (run_tokens, self.model_dim):
++            raise ValueError(
++                f"x_bf16 must have shape ({run_tokens}, {self.model_dim})"
++            )
+@@ -691,0 +857,2 @@ class MegaMoEV2:
++        if tuple(wts.shape) != (run_tokens, self.topk):
++            raise ValueError(f"wts must have shape ({run_tokens}, {self.topk})")
+@@ -693,0 +861,5 @@ class MegaMoEV2:
++        if tuple(topk_ids.shape) != (run_tokens, self.topk):
++            raise ValueError(
++                f"topk_ids must have shape ({run_tokens}, {self.topk})"
++            )
++        config = self._select_config(run_tokens)
+@@ -695,0 +868 @@ class MegaMoEV2:
++            self._retain_borrowed_weights((w1, w1_scale, w2, w2_scale))
+@@ -697 +870,12 @@ class MegaMoEV2:
+-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
++                x_q,
++                scales,
++                wts,
++                topk_ids,
++                run_tokens,
++                w1,
++                w1_scale,
++                w2,
++                w2_scale,
++                stream,
++                slice_output,
++                config=config,
+@@ -700 +883,0 @@ class MegaMoEV2:
+-        config = self._select_config(run_tokens)
+@@ -714,0 +898 @@ class MegaMoEV2:
++        self._retain_borrowed_weights((w1, w1_scale, w2, w2_scale))
+@@ -720,0 +905,4 @@ class MegaMoEV2:
++            w1,
++            w1_scale,
++            w2,
++            w2_scale,
+@@ -726,0 +915,40 @@ class MegaMoEV2:
++    def forward_with_weights(
++        self,
++        x_bf16,
++        wts,
++        topk_ids,
++        w1,
++        w1_scale,
++        w2,
++        w2_scale,
++        *,
++        stream=None,
++        slice_output=True,
++    ):
++        return self._forward_with_weights(
++            x_bf16,
++            wts,
++            topk_ids,
++            w1,
++            w1_scale,
++            w2,
++            w2_scale,
++            require_layout_marker=True,
++            stream=stream,
++            slice_output=slice_output,
++        )
++
++    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
++        return self._forward_with_weights(
++            x_bf16,
++            wts,
++            topk_ids,
++            self._bound_w1,
++            self._bound_w1_scale,
++            self._bound_w2,
++            self._bound_w2_scale,
++            require_layout_marker=False,
++            stream=stream,
++            slice_output=slice_output,
++        )
++
+@@ -727,0 +956 @@ class MegaMoEV2:
++        self._require_open()
+@@ -731 +960,73 @@ class MegaMoEV2:
+-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
++        return self._run_joint(
++            x_q,
++            scales,
++            wts,
++            topk_ids,
++            run_tokens,
++            self._bound_w1,
++            self._bound_w1_scale,
++            self._bound_w2,
++            self._bound_w2_scale,
++            stream,
++            slice_output,
++        )
++
++    @property
++    def symmetric_allocation_count(self):
++        return (
++            self.comb_op.symmetric_allocation_count
++            if self.comb_op is not None
++            else 0
++        )
++
++    @property
++    def symmetric_allocation_nbytes(self):
++        return (
++            self.comb_op.symmetric_allocation_nbytes
++            if self.comb_op is not None
++            else 0
++        )
++
++    def close(self):
++        if self._closed and self.comb_op is None:
++            return
++        self._closed = True
++        with torch.cuda.device(self.dev):
++            residual_stream = getattr(self, "_g2_residual_stream", None)
++            if residual_stream is not None:
++                residual_stream.synchronize()
++            torch.cuda.synchronize(self.dev)
++            workspace = getattr(self, "_s1_dispatch_workspace", None)
++            if workspace is not None:
++                workspace.clear()
++            for name in (
++                "_s1_rx",
++                "_s1_scale_i32",
++                "_s1_w1",
++                "_s1_w1_scale",
++                "_g2_residual_stream",
++                "_g2_residual_start",
++                "_g2_residual_done",
++            ):
++                if hasattr(self, name):
++                    setattr(self, name, None)
++            if self.comb_op is not None:
++                self.comb_op.close()
++                self.comb_op = None
++            for name, value in tuple(vars(self).items()):
++                if isinstance(value, torch.Tensor):
++                    setattr(self, name, None)
++            self._borrowed_weight_refs.clear()
++            self._bound_w1 = None
++            self._bound_w1_scale = None
++            self._bound_w2 = None
++            self._bound_w2_scale = None
++            self.w2 = None
++            self.w2_scale = None
++
++    def __enter__(self):
++        self._require_open()
++        return self
++
++    def __exit__(self, *_):
++        self.close()
+@@ -780 +1081,11 @@ class MegaMoEV2:
+-    def _fused_stage2_call(self, launcher, config, stream, *, runtime_pair_skip, scatter_vec):
++    def _fused_stage2_call(
++        self,
++        launcher,
++        config,
++        stream,
++        w2,
++        w2_scale,
++        *,
++        runtime_pair_skip,
++        scatter_vec,
++    ):
+@@ -788,2 +1099,2 @@ class MegaMoEV2:
+-            fx.Int64(self.w2.data_ptr()),
+-            fx.Int64(self.w2_scale.data_ptr()),
++            fx.Int64(w2.data_ptr()),
++            fx.Int64(w2_scale.data_ptr()),
+@@ -834,0 +1146,2 @@ class MegaMoEV2:
++            self._bound_w2,
++            self._bound_w2_scale,
+@@ -839 +1152,8 @@ class MegaMoEV2:
+-    def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
++    def _aligned_pair_stage2_call(
++        self,
++        launcher,
++        config: MegaMoEConfig,
++        stream,
++        w2,
++        w2_scale,
++    ):
+@@ -848,2 +1168,2 @@ class MegaMoEV2:
+-            fx.Int64(self.w2.data_ptr()),
+-            fx.Int64(self.w2_scale.data_ptr()),
++            fx.Int64(w2.data_ptr()),
++            fx.Int64(w2_scale.data_ptr()),
+@@ -882 +1202,7 @@ class MegaMoEV2:
+-        self._aligned_pair_stage2_call(self._g2_pair_preload, config, stream)
++        self._aligned_pair_stage2_call(
++            self._g2_pair_preload,
++            config,
++            stream,
++            self._bound_w2,
++            self._bound_w2_scale,
++        )
+@@ -924,0 +1251,2 @@ class MegaMoEV2:
++        w2=None,
++        w2_scale=None,
+@@ -925,0 +1254,4 @@ class MegaMoEV2:
++        if w2 is None:
++            w2 = self._bound_w2
++        if w2_scale is None:
++            w2_scale = self._bound_w2_scale
+@@ -935,0 +1268,2 @@ class MegaMoEV2:
++            w2,
++            w2_scale,
+@@ -947 +1281,7 @@ class MegaMoEV2:
+-    def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
++    def _launch_aligned_pair_stage2(
++        self,
++        config: MegaMoEConfig,
++        stream,
++        w2,
++        w2_scale,
++    ):
+@@ -954,0 +1295,2 @@ class MegaMoEV2:
++            w2,
++            w2_scale,
+@@ -962,0 +1305,2 @@ class MegaMoEV2:
++        w2,
++        w2_scale,
+@@ -974 +1318,6 @@ class MegaMoEV2:
+-        self._launch_aligned_pair_stage2(config, main_stream)
++        self._launch_aligned_pair_stage2(
++            config,
++            main_stream,
++            w2,
++            w2_scale,
++        )
+@@ -981,0 +1331,2 @@ class MegaMoEV2:
++            w2=w2,
++            w2_scale=w2_scale,
 diff --git a/op_tests/multigpu_tests/bench_mega_moe_v2.py b/op_tests/multigpu_tests/bench_mega_moe_v2.py
-index 25f72dd..cb07d13 100644
+index 25f72dd..e1815ff 100644
 --- a/op_tests/multigpu_tests/bench_mega_moe_v2.py
 +++ b/op_tests/multigpu_tests/bench_mega_moe_v2.py
 @@ -7,0 +8 @@ import argparse
@@ -118,6 +704,14 @@ index 25f72dd..cb07d13 100644
 +            raise ValueError("captured route rows do not cover the requested tokens")
 @@ -317,0 +354 @@ def main():
 +        None if route_ids is None else route_ids[:tokens],
+@@ -599,0 +637,7 @@ def main():
++    mori_graph = None
++    mega_graph = None
++    stage1_graph = None
++    stage2_graph = None
++    torch.cuda.synchronize()
++    barrier()
++    mega.close()
 diff --git a/op_tests/multigpu_tests/test_comm_fused_moe.py b/op_tests/multigpu_tests/test_comm_fused_moe.py
 index 946e575..c28b743 100644
 --- a/op_tests/multigpu_tests/test_comm_fused_moe.py
@@ -195,7 +789,7 @@ index 946e575..c28b743 100644
 +        if session is not None:
 +            session.runners.close()
 diff --git a/op_tests/multigpu_tests/test_mega_moe_v2.py b/op_tests/multigpu_tests/test_mega_moe_v2.py
-index ae5f820..50cb86a 100644
+index ae5f820..88a6007 100644
 --- a/op_tests/multigpu_tests/test_mega_moe_v2.py
 +++ b/op_tests/multigpu_tests/test_mega_moe_v2.py
 @@ -7,0 +8 @@ import argparse
@@ -219,11 +813,13 @@ index ae5f820..50cb86a 100644
 +    },
 @@ -102,0 +119 @@ def _make_inputs(
 +    route_ids,
-@@ -112 +129,12 @@ def _make_inputs(
+@@ -112 +129,14 @@ def _make_inputs(
 -    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
 +    if route_ids is not None:
 +        if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
-+            raise ValueError("captured routes cannot be combined with adversarial routes")
++            raise ValueError(
++                "captured routes cannot be combined with adversarial routes"
++            )
 +        if route_ids.ndim != 2 or tuple(route_ids.shape) != (tokens, topk):
 +            raise ValueError(
 +                f"captured routes have shape {tuple(route_ids.shape)}, "
@@ -233,23 +829,424 @@ index ae5f820..50cb86a 100644
 +            raise ValueError("captured routes contain an out-of-range expert ID")
 +        ids = route_ids.to(device=device, dtype=torch.int64)
 +    elif force_fanout_boundary or inject_invalid_route or force_padding_boundary:
-@@ -454,0 +483,5 @@ def main():
+@@ -166,0 +197 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
++    w1_kernel.is_shuffled = True
+@@ -180,0 +212 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
++    w2_kernel.is_shuffled = True
+@@ -454,0 +487,5 @@ def main():
 +    parser.add_argument(
 +        "--route-ids-json",
 +        type=Path,
 +        help="AgentX capture JSON containing a topk_ids matrix.",
 +    )
-@@ -474,0 +508,8 @@ def main():
+@@ -472,0 +510 @@ def main():
++    shared_moe = None
+@@ -474,0 +513,13 @@ def main():
 +        route_ids = None
 +        if args.route_ids_json is not None:
 +            payload = json.loads(args.route_ids_json.read_text())
-+            if int(payload.get("expert_count", network["experts"])) != network["experts"]:
-+                raise ValueError("captured route expert count does not match the network")
++            if (
++                int(payload.get("expert_count", network["experts"]))
++                != network["experts"]
++            ):
++                raise ValueError(
++                    "captured route expert count does not match the network"
++                )
 +            if int(payload.get("topk", network["topk"])) != network["topk"]:
 +                raise ValueError("captured route top-k does not match the network")
 +            route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
-@@ -515,0 +557 @@ def main():
+@@ -515,0 +567 @@ def main():
 +            route_ids=route_ids,
+@@ -525 +576,0 @@ def main():
+-        shared_moe = None
+@@ -531,0 +583,2 @@ def main():
++                if shared_moe is not None:
++                    shared_moe.close()
+@@ -593 +646,5 @@ def main():
+-        _cleanup()
++        try:
++            if shared_moe is not None:
++                shared_moe.close()
++        finally:
++            _cleanup()
+diff --git a/op_tests/multigpu_tests/test_mega_moe_v2_workspace.py b/op_tests/multigpu_tests/test_mega_moe_v2_workspace.py
+new file mode 100644
+index 0000000..9d04271
+--- /dev/null
++++ b/op_tests/multigpu_tests/test_mega_moe_v2_workspace.py
+@@ -0,0 +1,372 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++"""Distributed pooled-workspace and explicit-teardown validation for MegaMoEV2."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
++
++import torch
++import torch.distributed as dist
++
++from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
++from op_tests.multigpu_tests.test_mega_moe_v2 import (
++    NETWORKS,
++    _barrier,
++    _cleanup,
++    _make_inputs,
++    _quantize_weights,
++    _reference,
++    _setup_dist,
++)
++
++
++def _global_rel_l2(output, reference):
++    error_sq = torch.sum((output.float() - reference) ** 2)
++    reference_sq = torch.sum(reference.float() ** 2)
++    dist.all_reduce(error_sq)
++    dist.all_reduce(reference_sq)
++    return float(torch.sqrt(error_sq / reference_sq))
++
++
++def _weight_ptrs(packed):
++    return [tensor.data_ptr() for tensor in packed[:4]]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--network", choices=NETWORKS, default="dsv41")
++    parser.add_argument("--tokens", type=int, default=888)
++    parser.add_argument("--max-tok-per-rank", type=int, default=8192)
++    parser.add_argument("--alternations", type=int, default=40)
++    parser.add_argument("--accuracy-max-bs", type=int, default=888)
++    parser.add_argument("--rtol", type=float, default=0.10)
++    parser.add_argument("--route-ids-json", type=Path)
++    parser.add_argument("--output-json", type=Path)
++    args = parser.parse_args()
++
++    if args.tokens <= 0:
++        raise ValueError("--tokens must be positive")
++    if args.tokens > args.max_tok_per_rank:
++        raise ValueError("--tokens must not exceed --max-tok-per-rank")
++    if args.alternations < 2:
++        raise ValueError("--alternations must be at least two")
++
++    rank, world, device = _setup_dist()
++    runner = None
++    recreated = None
++    try:
++        network = NETWORKS[args.network]
++        if network["experts"] % world:
++            raise ValueError("network expert count must be divisible by world size")
++        local_experts = network["experts"] // world
++        route_ids = None
++        if args.route_ids_json is not None:
++            payload = json.loads(args.route_ids_json.read_text())
++            route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
++            if route_ids.shape[0] < args.tokens:
++                raise ValueError("captured route file has fewer rows than --tokens")
++
++        packed_a = _quantize_weights(
++            network["model_dim"],
++            network["inter_dim"],
++            local_experts,
++            rank,
++            17,
++            device,
++        )
++        packed_b = _quantize_weights(
++            network["model_dim"],
++            network["inter_dim"],
++            local_experts,
++            rank,
++            100017,
++            device,
++        )
++        x, route_weights, topk_ids = _make_inputs(
++            args.tokens,
++            network["model_dim"],
++            network["experts"],
++            network["topk"],
++            rank,
++            29,
++            device,
++            force_fanout_boundary=False,
++            inject_invalid_route=False,
++            force_padding_boundary=False,
++            route_ids=None if route_ids is None else route_ids[: args.tokens],
++        )
++        kernel_a = packed_a[:4]
++        kernel_b = packed_b[:4]
++        ptrs_a = _weight_ptrs(packed_a)
++        ptrs_b = _weight_ptrs(packed_b)
++
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats(device)
++        memory_before_workspace = torch.cuda.memory_allocated(device)
++        runner = MegaMoEV2(
++            rank=rank,
++            world_size=world,
++            quant="a8w4",
++            w1=kernel_a[0],
++            w1_scale=kernel_a[1],
++            w2=kernel_a[2],
++            w2_scale=kernel_a[3],
++            max_tok_per_rank=args.max_tok_per_rank,
++            **network,
++        )
++        memory_after_workspace = torch.cuda.memory_allocated(device)
++        symmetric_count = runner.symmetric_allocation_count
++        symmetric_nbytes = runner.symmetric_allocation_nbytes
++        if symmetric_count <= 0 or symmetric_nbytes <= 0:
++            raise AssertionError("workspace did not report symmetric allocations")
++
++        noncontiguous_w1 = kernel_a[0].reshape(2, -1).transpose(0, 1)
++        try:
++            runner.forward_with_weights(
++                x,
++                route_weights,
++                topk_ids,
++                noncontiguous_w1,
++                kernel_a[1],
++                kernel_a[2],
++                kernel_a[3],
++            )
++        except ValueError as error:
++            if "contiguous" not in str(error):
++                raise
++        else:
++            raise AssertionError("non-contiguous pooled weight did not fail")
++
++        unmarked_w1 = kernel_a[0].detach()
++        if hasattr(unmarked_w1, "is_shuffled"):
++            del unmarked_w1.is_shuffled
++        try:
++            runner.forward_with_weights(
++                x,
++                route_weights,
++                topk_ids,
++                unmarked_w1,
++                kernel_a[1],
++                kernel_a[2],
++                kernel_a[3],
++            )
++        except ValueError as error:
++            if "shuffled" not in str(error):
++                raise
++        else:
++            raise AssertionError("unmarked pooled weight did not fail")
++
++        def run_with(kernel_weights):
++            return runner.forward_with_weights(
++                x,
++                route_weights,
++                topk_ids,
++                *kernel_weights,
++            )
++
++        output_a_first = run_with(kernel_a).clone()
++        _barrier()
++        output_b = run_with(kernel_b).clone()
++        _barrier()
++        memory_steady_start = torch.cuda.memory_allocated(device)
++        for index in range(args.alternations):
++            run_with(kernel_a if index % 2 == 0 else kernel_b)
++        torch.cuda.synchronize()
++        memory_after_alternations = torch.cuda.memory_allocated(device)
++        output_a_last = run_with(kernel_a).clone()
++        _barrier()
++
++        exact_a = torch.tensor(
++            int(torch.equal(output_a_first, output_a_last)),
++            dtype=torch.int32,
++            device=device,
++        )
++        distinct_b = torch.tensor(
++            int(not torch.equal(output_a_first, output_b)),
++            dtype=torch.int32,
++            device=device,
++        )
++        dist.all_reduce(exact_a, op=dist.ReduceOp.MIN)
++        dist.all_reduce(distinct_b, op=dist.ReduceOp.MIN)
++        if not int(exact_a.item()):
++            raise AssertionError("A/B/A alternation changed the repeated A output")
++        if not int(distinct_b.item()):
++            raise AssertionError("independent B weights did not change the output")
++        if _weight_ptrs(packed_a) != ptrs_a or _weight_ptrs(packed_b) != ptrs_b:
++            raise AssertionError("pooled execution replaced a model weight tensor")
++        if runner.symmetric_allocation_count != symmetric_count:
++            raise AssertionError(
++                "symmetric allocation count grew across layer bindings"
++            )
++        if runner.symmetric_allocation_nbytes != symmetric_nbytes:
++            raise AssertionError(
++                "symmetric allocation bytes grew across layer bindings"
++            )
++
++        steady_growth = memory_after_alternations - memory_steady_start
++        if steady_growth > 64 * 1024 * 1024:
++            raise AssertionError(
++                f"steady pooled calls grew allocated memory by {steady_growth} bytes"
++            )
++
++        rel_l2_a = -1.0
++        rel_l2_b = -1.0
++        if args.tokens <= args.accuracy_max_bs:
++            reference_a = _reference(
++                x,
++                route_weights,
++                topk_ids,
++                packed_a[4:],
++                rank,
++                world,
++                network["model_dim"],
++                network["inter_dim"],
++                network["experts"],
++                network["swiglu_limit"],
++            )
++            rel_l2_a = _global_rel_l2(output_a_first, reference_a)
++            reference_b = _reference(
++                x,
++                route_weights,
++                topk_ids,
++                packed_b[4:],
++                rank,
++                world,
++                network["model_dim"],
++                network["inter_dim"],
++                network["experts"],
++                network["swiglu_limit"],
++            )
++            rel_l2_b = _global_rel_l2(output_b, reference_b)
++            if max(rel_l2_a, rel_l2_b) >= args.rtol:
++                raise AssertionError(
++                    f"pooled relL2 A/B={rel_l2_a:.6f}/{rel_l2_b:.6f} "
++                    f"exceeds {args.rtol}"
++                )
++
++        graph_holder = {}
++
++        def graph_body():
++            graph_holder["output"] = run_with(kernel_a)
++
++        graph_body()
++        _barrier()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
++            graph_body()
++        run_with(kernel_b)
++        _barrier()
++        graph.replay()
++        torch.cuda.synchronize()
++        graph_exact = torch.tensor(
++            int(torch.equal(graph_holder["output"], output_a_first)),
++            dtype=torch.int32,
++            device=device,
++        )
++        dist.all_reduce(graph_exact, op=dist.ReduceOp.MIN)
++        if not int(graph_exact.item()):
++            raise AssertionError("pooled graph replay changed the A output")
++        graph = None
++        graph_holder.clear()
++        torch.cuda.synchronize()
++
++        metrics = {
++            "rank": rank,
++            "network": args.network,
++            "tokens": args.tokens,
++            "max_tok_per_rank": args.max_tok_per_rank,
++            "alternations": args.alternations,
++            "symmetric_allocation_count": symmetric_count,
++            "symmetric_allocation_nbytes": symmetric_nbytes,
++            "cuda_workspace_delta_bytes": (
++                memory_after_workspace - memory_before_workspace
++            ),
++            "steady_growth_bytes": steady_growth,
++            "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
++            "rel_l2_a": rel_l2_a,
++            "rel_l2_b": rel_l2_b,
++            "graph_replay_exact": True,
++            "weight_ptrs_a": ptrs_a,
++            "weight_ptrs_b": ptrs_b,
++        }
++
++        original_device = torch.cuda.current_device()
++        switched_device = original_device
++        if torch.cuda.device_count() > 1:
++            switched_device = (original_device + 1) % torch.cuda.device_count()
++            torch.cuda.set_device(switched_device)
++        runner.close()
++        runner.close()
++        torch.cuda.set_device(original_device)
++        metrics["close_from_device"] = switched_device
++        if runner.symmetric_allocation_count or runner.symmetric_allocation_nbytes:
++            raise AssertionError("close left symmetric allocations tracked")
++        try:
++            runner.forward_with_weights(
++                x,
++                route_weights,
++                topk_ids,
++                *kernel_a,
++            )
++        except RuntimeError as error:
++            if "closed" not in str(error):
++                raise
++        else:
++            raise AssertionError("post-close pooled call did not fail")
++
++        recreated = MegaMoEV2(
++            rank=rank,
++            world_size=world,
++            quant="a8w4",
++            w1=kernel_a[0],
++            w1_scale=kernel_a[1],
++            w2=kernel_a[2],
++            w2_scale=kernel_a[3],
++            max_tok_per_rank=args.max_tok_per_rank,
++            **network,
++        )
++        recreated(x, route_weights, topk_ids)
++        _barrier()
++        recreated.close()
++        recreated.close()
++        metrics["close_recreate"] = True
++
++        gathered = [None] * world
++        dist.all_gather_object(gathered, metrics)
++        if rank == 0:
++            summary = {
++                "status": "PASS",
++                "world_size": world,
++                "ranks": gathered,
++            }
++            if args.output_json is not None:
++                args.output_json.parent.mkdir(parents=True, exist_ok=True)
++                args.output_json.write_text(json.dumps(summary, indent=2) + "\n")
++            print(
++                "[POOLED-WORKSPACE] "
++                f"PASS network={args.network} tokens={args.tokens} "
++                f"mtpr={args.max_tok_per_rank} "
++                f"alternations={args.alternations} symm_count={symmetric_count} "
++                f"symm_gib={symmetric_nbytes / 2**30:.3f} "
++                f"relL2={rel_l2_a:.6f}/{rel_l2_b:.6f} "
++                "graph_replay=PASS close_recreate=PASS",
++                flush=True,
++            )
++    finally:
++        try:
++            if recreated is not None:
++                recreated.close()
++            if runner is not None:
++                runner.close()
++        finally:
++            _cleanup()
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/op_tests/tuners/tune_comm_fused_moe.py b/op_tests/tuners/tune_comm_fused_moe.py
 index ad75a04..cbe5ccb 100644
 --- a/op_tests/tuners/tune_comm_fused_moe.py

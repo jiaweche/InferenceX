@@ -137,7 +137,7 @@ source and a locally built MoRI Python 3.12 package into that image.
 
 The branch contains:
 
-- `plans/DSV41_FLASH_MEGAMOE_AGENTX.md`: the full bring-up and integration
+- `plans/01_DSV41_FLASH_MEGAMOE_AGENTX.md`: the full bring-up and integration
   plan;
 - `runners/run_dsv41flash_agentx_mi350x-ruby.sh`: a dedicated V4.1 Ruby
   vLLM/DSpark preset, separate from the V4-Pro SGLang preset;

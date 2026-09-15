@@ -20,17 +20,20 @@ This file is the master plan. Keep focused implementation details in linked
 child plans and roll their final revisions, evidence, and decisions back into
 this file.
 
+Completed child plan:
+
+- [Pooled AITER workspace and explicit teardown](./03_DSV41_FLASH_MEGAMOE_POOLED_AITER_WORKSPACE.md)
+
 Current child plan:
 
-- [Pooled AITER workspace and explicit teardown](./DSV41_FLASH_MEGAMOE_POOLED_AITER_WORKSPACE.md)
+- [Selective vLLM MegaMoEV2 adapter](./04_DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md)
 
 Validated continuation evidence:
 
-- [Ruby handoff and measured shape/A-B results](./DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md)
+- [Ruby handoff and measured shape/A-B results](./02_DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md)
 
-The successor child, created only after the pooled-workspace gates pass, is
-`plans/DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md`. It will own the prefill-only
-vLLM adapter and matched serving A/B.
+The vLLM adapter child owns the prefill-only integration and matched serving
+A/B. It may advance to indexed plan 05 only after those gates pass.
 
 ## 2. Branch and source baseline
 
