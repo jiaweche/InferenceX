@@ -1,0 +1,367 @@
+diff --git a/aiter/ops/comm_fused_moe_runtime.py b/aiter/ops/comm_fused_moe_runtime.py
+index 8528a52..54a698b 100644
+--- a/aiter/ops/comm_fused_moe_runtime.py
++++ b/aiter/ops/comm_fused_moe_runtime.py
+@@ -7,0 +8 @@ from collections.abc import Callable
++from dataclasses import replace
+@@ -91,0 +93,13 @@ class CommFusedMoeRuntime:
++        metadata_transform = None
++        if getattr(runner, "requires_token_major_stage2_input", False):
++
++            def metadata_transform(metadata):
++                # Tuned ``*_moe2_layout_*`` rows normally ask Stage1 for a
++                # padded expert-sorted intermediate. Communication-fused
++                # producers resolve sorted route IDs back into compact
++                # [token, slot, K] rows, so preserve the same kernel selection
++                # while requesting Stage1's token-major output ABI.
++                if not metadata.skip_inter_quant:
++                    return metadata
++                return replace(metadata, skip_inter_quant=False)
++
+@@ -93,0 +108 @@ class CommFusedMoeRuntime:
++            _metadata_transform=metadata_transform,
+diff --git a/aiter/ops/flydsl/comm_fused_moe_host.py b/aiter/ops/flydsl/comm_fused_moe_host.py
+index e9a0e0b..1df7162 100644
+--- a/aiter/ops/flydsl/comm_fused_moe_host.py
++++ b/aiter/ops/flydsl/comm_fused_moe_host.py
+@@ -438 +438,19 @@ def _stage2_args(args, kwargs, config):
+-class _AtomicRunner:
++class _CommunicatorRunner:
++    """Own and deterministically release one runner's MoRI resources."""
++
++    def close(self) -> None:
++        comm = getattr(self, "comm", None)
++        if comm is None:
++            return
++        torch.cuda.synchronize(self.device)
++        comm.barrier()
++        comm.destroy()
++        self.comm = None
++        self.windows = ()
++        if hasattr(self, "shared_partial_window"):
++            self.shared_partial_window = None
++
++
++class _AtomicRunner(_CommunicatorRunner):
++    requires_token_major_stage2_input = False
++
+@@ -536 +554 @@ class _AtomicRunner:
+-class _MegakernelRunner:
++class _MegakernelRunner(_CommunicatorRunner):
+@@ -538,0 +557,2 @@ class _MegakernelRunner:
++    requires_token_major_stage2_input = True
++
+@@ -635 +655,3 @@ class _MegakernelRunner:
+-class _WindowRunner:
++class _WindowRunner(_CommunicatorRunner):
++    requires_token_major_stage2_input = True
++
+@@ -868,0 +891,5 @@ class _LazyRunners:
++    def close(self) -> None:
++        for runner in reversed(tuple(self.instances.values())):
++            runner.close()
++        self.instances.clear()
++
+diff --git a/op_tests/multigpu_tests/bench_mega_moe_v2.py b/op_tests/multigpu_tests/bench_mega_moe_v2.py
+index 25f72dd..cb07d13 100644
+--- a/op_tests/multigpu_tests/bench_mega_moe_v2.py
++++ b/op_tests/multigpu_tests/bench_mega_moe_v2.py
+@@ -7,0 +8 @@ import argparse
++import json
+@@ -88 +89,12 @@ def barrier():
+-def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, device):
++def make_inputs(
++    tokens,
++    rank,
++    world,
++    model_dim,
++    experts,
++    topk,
++    route,
++    hot_bias,
++    device,
++    route_ids=None,
++):
+@@ -100 +112,10 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias,
+-    if route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
++    if route_ids is not None:
++        if route_ids.ndim != 2 or tuple(route_ids.shape) != (tokens, topk):
++            raise ValueError(
++                f"captured routes have shape {tuple(route_ids.shape)}, "
++                f"expected {(tokens, topk)}"
++            )
++        if int(route_ids.min()) < 0 or int(route_ids.max()) >= experts:
++            raise ValueError("captured routes contain an out-of-range expert ID")
++        ids = route_ids.to(device=device, dtype=torch.int64)
++    elif route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
+@@ -259,0 +281,5 @@ def main():
++    parser.add_argument(
++        "--route-ids-json",
++        type=Path,
++        help="AgentX capture JSON containing a topk_ids matrix.",
++    )
+@@ -277,2 +303,2 @@ def main():
+-    if world != 8:
+-        raise ValueError("This comparison requires eight ranks")
++    if world not in (2, 4, 8):
++        raise ValueError("This comparison requires 2, 4, or 8 ranks")
+@@ -285,0 +312,10 @@ def main():
++    route_ids = None
++    if args.route_ids_json is not None:
++        payload = json.loads(args.route_ids_json.read_text())
++        if int(payload.get("expert_count", args.experts)) != args.experts:
++            raise ValueError("captured route expert count does not match --experts")
++        if int(payload.get("topk", args.topk)) != args.topk:
++            raise ValueError("captured route top-k does not match --topk")
++        route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
++        if route_ids.shape[0] < max_rank_tokens:
++            raise ValueError("captured route rows do not cover the requested tokens")
+@@ -317,0 +354 @@ def main():
++        None if route_ids is None else route_ids[:tokens],
+diff --git a/op_tests/multigpu_tests/test_comm_fused_moe.py b/op_tests/multigpu_tests/test_comm_fused_moe.py
+index 946e575..c28b743 100644
+--- a/op_tests/multigpu_tests/test_comm_fused_moe.py
++++ b/op_tests/multigpu_tests/test_comm_fused_moe.py
+@@ -106 +106,2 @@ class Stage2Case:
+-    inter_states: torch.Tensor
++    ordinary_inter_states: torch.Tensor
++    comm_fused_inter_states: torch.Tensor
+@@ -240,0 +242,28 @@ def _make_routes(tokens: int, route: str, device):
++def _token_major_to_sorted_routes(
++    values: torch.Tensor,
++    sorted_ids: torch.Tensor,
++    num_valid_ids: torch.Tensor,
++    tokens: int,
++) -> torch.Tensor:
++    """Gather compact [token, slot, K] values into the padded Stage2 row ABI."""
++
++    packed = sorted_ids.to(torch.int64)
++    token = packed & 0x00FFFFFF
++    slot = (packed >> 24) & 0xFF
++    valid = (
++        (
++            torch.arange(sorted_ids.numel(), device=sorted_ids.device)
++            < num_valid_ids[0]
++        )
++        & (token < tokens)
++        & (slot < values.shape[1])
++    )
++    out = torch.zeros(
++        (sorted_ids.numel(), values.shape[-1]),
++        dtype=values.dtype,
++        device=values.device,
++    )
++    out[valid] = values[token[valid], slot[valid]]
++    return out
++
++
+@@ -310,0 +340 @@ def _make_stage2_case(
++    ordinary_requires_sorted_input: bool,
+@@ -354 +384 @@ def _make_stage2_case(
+-    inter_states, reference_a2_scale = per_1x32_f8_scale_f8_quant(
++    comm_fused_inter_states, reference_a2_scale = per_1x32_f8_scale_f8_quant(
+@@ -358,0 +389,13 @@ def _make_stage2_case(
++    comm_fused_inter_states = comm_fused_inter_states.view(
++        tokens, TOPK, INTER_DIM
++    )
++    ordinary_inter_states = (
++        _token_major_to_sorted_routes(
++            comm_fused_inter_states,
++            sorted_ids,
++            num_valid_ids,
++            tokens,
++        )
++        if ordinary_requires_sorted_input
++        else comm_fused_inter_states
++    )
+@@ -374 +417,2 @@ def _make_stage2_case(
+-        inter_states=inter_states.view(tokens, TOPK, INTER_DIM),
++        ordinary_inter_states=ordinary_inter_states,
++        comm_fused_inter_states=comm_fused_inter_states,
+@@ -436 +480 @@ def _torch_stage2_allreduce(
+-        case.inter_states,
++        case.comm_fused_inter_states,
+@@ -454 +498 @@ def _run_ordinary_stage2(
+-        case.inter_states,
++        case.ordinary_inter_states,
+@@ -481,0 +526 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
++        "_moe2_layout_" in kernel_name,
+@@ -817 +862 @@ def _run_stage2_case(
+-                case.inter_states,
++                case.comm_fused_inter_states,
+@@ -1068,0 +1114 @@ def main() -> None:
++        session = _ACTIVE_SESSION
+@@ -1069,0 +1116,2 @@ def main() -> None:
++        if session is not None:
++            session.runners.close()
+diff --git a/op_tests/multigpu_tests/test_mega_moe_v2.py b/op_tests/multigpu_tests/test_mega_moe_v2.py
+index ae5f820..50cb86a 100644
+--- a/op_tests/multigpu_tests/test_mega_moe_v2.py
++++ b/op_tests/multigpu_tests/test_mega_moe_v2.py
+@@ -7,0 +8 @@ import argparse
++import json
+@@ -9,0 +11 @@ from dataclasses import replace
++from pathlib import Path
+@@ -39,0 +42,14 @@ NETWORKS = {
++    "dsv41": {
++        "model_dim": 5120,
++        "inter_dim": 2304,
++        "experts": 384,
++        "topk": 6,
++        "swiglu_limit": 10.0,
++    },
++    "dsv41_dspark": {
++        "model_dim": 5120,
++        "inter_dim": 2304,
++        "experts": 128,
++        "topk": 3,
++        "swiglu_limit": 10.0,
++    },
+@@ -102,0 +119 @@ def _make_inputs(
++    route_ids,
+@@ -112 +129,12 @@ def _make_inputs(
+-    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
++    if route_ids is not None:
++        if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
++            raise ValueError("captured routes cannot be combined with adversarial routes")
++        if route_ids.ndim != 2 or tuple(route_ids.shape) != (tokens, topk):
++            raise ValueError(
++                f"captured routes have shape {tuple(route_ids.shape)}, "
++                f"expected {(tokens, topk)}"
++            )
++        if int(route_ids.min()) < 0 or int(route_ids.max()) >= experts:
++            raise ValueError("captured routes contain an out-of-range expert ID")
++        ids = route_ids.to(device=device, dtype=torch.int64)
++    elif force_fanout_boundary or inject_invalid_route or force_padding_boundary:
+@@ -454,0 +483,5 @@ def main():
++    parser.add_argument(
++        "--route-ids-json",
++        type=Path,
++        help="AgentX capture JSON containing a topk_ids matrix.",
++    )
+@@ -474,0 +508,8 @@ def main():
++        route_ids = None
++        if args.route_ids_json is not None:
++            payload = json.loads(args.route_ids_json.read_text())
++            if int(payload.get("expert_count", network["experts"])) != network["experts"]:
++                raise ValueError("captured route expert count does not match the network")
++            if int(payload.get("topk", network["topk"])) != network["topk"]:
++                raise ValueError("captured route top-k does not match the network")
++            route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
+@@ -515,0 +557 @@ def main():
++            route_ids=route_ids,
+diff --git a/op_tests/tuners/tune_comm_fused_moe.py b/op_tests/tuners/tune_comm_fused_moe.py
+index ad75a04..cbe5ccb 100644
+--- a/op_tests/tuners/tune_comm_fused_moe.py
++++ b/op_tests/tuners/tune_comm_fused_moe.py
+@@ -389,14 +389,15 @@ def benchmark(
+-    runner.output.fill_(float("nan"))
+-    candidate_shared = shared_partial.clone()
+-    prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
+-
+-    def run():
+-        current_shared = candidate_shared
+-        if prepare_shared_partial is not None:
+-            current_shared = prepare_shared_partial(current_shared)
+-        return runner(
+-            stage2_args=stage2_args,
+-            stage2_kwargs=stage2_kwargs,
+-            shared_partial=current_shared,
+-            ordinary_stage2=ordinary_stage2,
+-        )
++    try:
++        runner.output.fill_(float("nan"))
++        candidate_shared = shared_partial.clone()
++        prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
++
++        def run():
++            current_shared = candidate_shared
++            if prepare_shared_partial is not None:
++                current_shared = prepare_shared_partial(current_shared)
++            return runner(
++                stage2_args=stage2_args,
++                stage2_kwargs=stage2_kwargs,
++                shared_partial=current_shared,
++                ordinary_stage2=ordinary_stage2,
++            )
+@@ -404,7 +405,8 @@ def benchmark(
+-    reference_f32 = reference.float()
+-    output = run()
+-    diff = output.float() - reference_f32
+-    error = torch.stack(
+-        (
+-            diff.abs().max(),
+-            diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
++        reference_f32 = reference.float()
++        output = run()
++        diff = output.float() - reference_f32
++        error = torch.stack(
++            (
++                diff.abs().max(),
++                diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
++            )
+@@ -412,17 +414,10 @@ def benchmark(
+-    )
+-    dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
+-
+-    latency_us = _graph_latency_us(
+-        run,
+-        tp_group=tp_group,
+-        process_group=process_group,
+-        device=shared_partial.device,
+-        warmup_replays=warmup_replays,
+-        rounds=rounds,
+-        iterations=iterations,
+-    )
+-    graph_diff = output.float() - reference_f32
+-    graph_error = torch.stack(
+-        (
+-            graph_diff.abs().max(),
+-            graph_diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
++        dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
++
++        latency_us = _graph_latency_us(
++            run,
++            tp_group=tp_group,
++            process_group=process_group,
++            device=shared_partial.device,
++            warmup_replays=warmup_replays,
++            rounds=rounds,
++            iterations=iterations,
+@@ -430,11 +425,19 @@ def benchmark(
+-    )
+-    dist.all_reduce(graph_error, op=dist.ReduceOp.MAX, group=process_group)
+-    error = torch.maximum(error, graph_error)
+-
+-    return TuningResult(
+-        config,
+-        latency_us,
+-        float(error[0].item()),
+-        float(error[1].item()),
+-        int(stage2_kwargs["block_m"]),
+-    )
++        graph_diff = output.float() - reference_f32
++        graph_error = torch.stack(
++            (
++                graph_diff.abs().max(),
++                graph_diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
++            )
++        )
++        dist.all_reduce(graph_error, op=dist.ReduceOp.MAX, group=process_group)
++        error = torch.maximum(error, graph_error)
++
++        return TuningResult(
++            config,
++            latency_us,
++            float(error[0].item()),
++            float(error[1].item()),
++            int(stage2_kwargs["block_m"]),
++        )
++    finally:
++        runner.close()
+@@ -699 +702,4 @@ def main():
+-        current = winners_for(shape).get(args.token)
++        try:
++            current = winners_for(shape).get(args.token)
++        except KeyError:
++            current = None

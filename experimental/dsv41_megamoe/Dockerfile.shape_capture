@@ -1,0 +1,12 @@
+FROM vllm/vllm-openai-rocm@sha256:960228cfcb5de9f4cd22d28998d1125be62b546c3d220a884f570343e99ffcee
+
+COPY vllm-moe-shape-capture.patch /tmp/vllm-moe-shape-capture.patch
+RUN echo \
+      "968b47dc99d301abbd7a75b07c7e103455e28227c7986ef2ce7b15b877f0634f  /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/runner/moe_runner.py" \
+      | sha256sum --check --strict - \
+    && patch --directory=/usr/local/lib/python3.12/dist-packages \
+      --strip=1 < /tmp/vllm-moe-shape-capture.patch \
+    && rm /tmp/vllm-moe-shape-capture.patch
+
+LABEL org.opencontainers.image.base.digest="sha256:960228cfcb5de9f4cd22d28998d1125be62b546c3d220a884f570343e99ffcee"
+LABEL org.opencontainers.image.description="Diagnostic-only DeepSeek V4.1 MoE shape capture"

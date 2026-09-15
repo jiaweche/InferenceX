@@ -1,0 +1,52 @@
+diff --git a/include/mori/cco/cco.hpp b/include/mori/cco/cco.hpp
+index e7471b9..3a01bb6 100644
+--- a/include/mori/cco/cco.hpp
++++ b/include/mori/cco/cco.hpp
+@@ -886,0 +887 @@ struct ccoComm {
++    bool ownsPhysHandle{true};
+diff --git a/src/cco/cco_init.cpp b/src/cco/cco_init.cpp
+index 3f60941..f8f338a 100644
+--- a/src/cco/cco_init.cpp
++++ b/src/cco/cco_init.cpp
+@@ -733 +733,3 @@ int ccoCommDestroy(ccoComm* comm) {
+-    (void)hipMemRelease(meta.physHandle);
++    if (meta.ownsPhysHandle) {
++      (void)hipMemRelease(meta.physHandle);
++    }
+@@ -899,5 +901,4 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
+-// allocating new physical memory. Mirrors ccoMemAlloc, except the physical
+-// handle comes from hipMemRetainAllocationHandle(externalPtr) instead of
+-// hipMemCreate. The retained handle is refcounted: ccoMemFree's hipMemRelease
+-// balances this retain; the external owner (e.g. torch.symm_mem) keeps its own
+-// mapping and refcount alive independently.
++// allocating new physical memory. hipMemRetainAllocationHandle returns the
++// handle owned by the external allocator on ROCm 7.2; it is borrowed here and
++// must not be released by CCO. The external owner keeps it alive until after
++// this alias is unmapped.
+@@ -939 +939,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-    (void)hipMemRelease(physHandle);
+@@ -947 +946,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-    (void)hipMemRelease(physHandle);
+@@ -955 +953,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-    (void)hipMemRelease(physHandle);
+@@ -963 +960,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-    (void)hipMemRelease(physHandle);
+@@ -979 +975,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-    (void)hipMemRelease(physHandle);
+@@ -1002 +997,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-      (void)hipMemRelease(physHandle);
+@@ -1013,0 +1009 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
++  meta.ownsPhysHandle = false;
+@@ -1032 +1027,0 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+-      (void)hipMemRelease(physHandle);
+@@ -1083,4 +1078,6 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
+-    err = hipMemRelease(meta.physHandle);
+-    if (err != hipSuccess) {
+-      MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
+-                      hipGetErrorString(err));
++    if (meta.ownsPhysHandle) {
++      err = hipMemRelease(meta.physHandle);
++      if (err != hipSuccess) {
++        MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
++                        hipGetErrorString(err));
++      }

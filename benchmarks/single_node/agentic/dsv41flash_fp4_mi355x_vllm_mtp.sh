@@ -41,6 +41,18 @@ export AITER_TRITON_LOG_LEVEL=ERROR
 # cudagraph path -- amd/attention.py uses eager_break_during_capture.
 export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export OMP_NUM_THREADS=1
+shape_capture=0
+case "${VLLM_MOE_SHAPE_CAPTURE:-0}" in
+    1|true|TRUE|yes|YES)
+        shape_capture=1
+        export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+        export VLLM_MOE_SHAPE_CAPTURE_PATH="${VLLM_MOE_SHAPE_CAPTURE_PATH:-/results/moe_shape_capture.jsonl}"
+        export VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE="${VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE:-/results/moe_shape_capture.active}"
+        rm -f \
+            "$VLLM_MOE_SHAPE_CAPTURE_PATH" \
+            "$VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE"
+        ;;
+esac
 # Pin the full-context corpus for this 1M-context recipe.
 export WEKA_LOADER_OVERRIDE=semianalysis_cc_traces_weka_062126
 resolve_trace_source
@@ -101,12 +113,22 @@ VLLM_CMD=(
     --max-num-batched-tokens 16384
     --disable-uvicorn-access-log
 )
+if (( shape_capture )); then
+    # Diagnostic only: Python must observe every real routing invocation.
+    VLLM_CMD+=(--enforce-eager)
+fi
 printf '%q ' "${VLLM_CMD[@]}" | tee "$RESULT_DIR/vllm_command.txt"
 printf '\n' | tee -a "$RESULT_DIR/vllm_command.txt"
 SERVER_PID=""
+SHAPE_CAPTURE_WATCHER_PID=""
 cleanup_server() {
     local rc=$?
     trap - EXIT INT TERM
+    if (( shape_capture )); then
+        [[ -z "$SHAPE_CAPTURE_WATCHER_PID" ]] ||
+            kill "$SHAPE_CAPTURE_WATCHER_PID" 2>/dev/null || true
+        rm -f "$VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE"
+    fi
     stop_background_process_tree "$SERVER_PID" "vLLM server" 60
     exit "$rc"
 }
@@ -121,5 +143,25 @@ if [[ "${EVAL_ONLY:-false}" == true ]]; then
     run_eval --port "$PORT"
 else
     build_replay_cmd "$RESULT_DIR"
+    if (( shape_capture )); then
+        (
+            while kill -0 "$SERVER_PID" 2>/dev/null; do
+                if [[ -f "$RESULT_DIR/benchmark.log" ]] &&
+                   [[ "$(< "$RESULT_DIR/benchmark.log")" == *"Phase profiling (profiling) started"* ]]; then
+                    : > "$VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE"
+                    exit 0
+                fi
+                sleep 1
+            done
+            exit 1
+        ) &
+        SHAPE_CAPTURE_WATCHER_PID=$!
+    fi
     run_agentic_replay_and_write_outputs "$RESULT_DIR"
+    if (( shape_capture )); then
+        [[ -z "$SHAPE_CAPTURE_WATCHER_PID" ]] ||
+            kill "$SHAPE_CAPTURE_WATCHER_PID" 2>/dev/null || true
+        SHAPE_CAPTURE_WATCHER_PID=""
+        rm -f "$VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE"
+    fi
 fi

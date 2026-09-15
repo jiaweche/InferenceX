@@ -26,8 +26,9 @@ if (( ${#missing_vars[@]} )); then
 fi
 
 if command -v squeue >/dev/null 2>&1; then
+    allocation_user="$(id -u)"
     allocation_id="$(
-        squeue --noheader --user "$USER" --nodelist "$node" --states RUNNING --format '%A' |
+        squeue --noheader --user "$allocation_user" --nodelist "$node" --states RUNNING --format '%A' |
             awk 'NF { print; exit }'
     )"
     if [[ -z "$allocation_id" ]]; then
@@ -154,6 +155,8 @@ env_names=(
     AIPERF_WARMUP_REQUESTS_PER_LANE AIPERF_EXPERIMENTAL_FAST
     AIPERF_UNSAFE_OVERRIDE AIPERF_FAILED_REQUEST_THRESHOLD
     AIPERF_LIVE_FAILED_REQUEST_THRESHOLD ENABLE_AGENTX_POWER
+    VLLM_MOE_SHAPE_CAPTURE VLLM_MOE_SHAPE_CAPTURE_PATH
+    VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE
     HICACHE_RATIO HICACHE_WRITE_POLICY HICACHE_IO_BACKEND HICACHE_MEM_LAYOUT
     ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
     TMPDIR XDG_CACHE_HOME

@@ -1,0 +1,148 @@
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -2,0 +3,3 @@
++import json
++import os
++import time
+@@ -7,0 +11 @@
++import torch.distributed as dist
+@@ -56,0 +61,137 @@
++_SHAPE_CAPTURE_EVENT = 0
++
++
++def _shape_capture_metadata() -> tuple[str, dict[str, int]]:
++    if not is_forward_context_available():
++        return "no_forward_context", {}
++    metadata = get_forward_context().attn_metadata
++    if metadata is None:
++        return "warmup", {}
++
++    pending = [metadata]
++    seen: set[int] = set()
++    while pending:
++        candidate = pending.pop(0)
++        if id(candidate) in seen:
++            continue
++        seen.add(id(candidate))
++        if isinstance(candidate, dict):
++            pending.extend(candidate.values())
++            continue
++        if isinstance(candidate, (list, tuple)):
++            pending.extend(candidate)
++            continue
++
++        details = {}
++        for name in (
++            "num_prefills",
++            "num_prefill_tokens",
++            "num_decodes",
++            "num_decode_tokens",
++        ):
++            value = getattr(candidate, name, None)
++            if value is not None:
++                try:
++                    details[name] = int(value)
++                except (TypeError, ValueError):
++                    pass
++        if details:
++            has_prefill = details.get("num_prefills", 0) > 0 or (
++                details.get("num_prefill_tokens", 0) > 0
++            )
++            has_decode = details.get("num_decodes", 0) > 0 or (
++                details.get("num_decode_tokens", 0) > 0
++            )
++            if has_prefill and has_decode:
++                return "mixed", details
++            if has_prefill:
++                return "prefill", details
++            if has_decode:
++                return "decode", details
++            return "empty", details
++    return "unknown", {}
++
++
++def _shape_capture_padding() -> torch.Tensor | None:
++    if not is_forward_context_available():
++        return None
++    context = get_forward_context()
++    if context.is_padding is not None:
++        return context.is_padding
++
++    slot_mapping = context.slot_mapping
++    if isinstance(slot_mapping, list):
++        slot_mapping = slot_mapping[0]
++    if isinstance(slot_mapping, dict):
++        sample = next(iter(slot_mapping.values()), None)
++        if isinstance(sample, torch.Tensor):
++            return sample < 0
++    return None
++
++
++def _capture_moe_shape(runner, topk_ids: torch.Tensor) -> None:
++    path = os.environ.get("VLLM_MOE_SHAPE_CAPTURE_PATH")
++    active_file = os.environ.get("VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE")
++    if not path or (active_file and not os.path.exists(active_file)):
++        return
++    if dist.is_initialized() and dist.get_rank() != 0:
++        return
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("MoE shape capture requires --enforce-eager")
++
++    padded_m = int(topk_ids.shape[0])
++    padding = None
++    try:
++        padding = _shape_capture_padding()
++    except (AssertionError, AttributeError):
++        pass
++    valid_rows = torch.ones(padded_m, dtype=torch.bool, device=topk_ids.device)
++    if isinstance(padding, torch.Tensor) and padding.numel() >= padded_m:
++        valid_rows = ~padding[:padded_m].to(torch.bool)
++
++    raw_topk_ids = topk_ids[valid_rows]
++    expert_count = int(runner.moe_config.num_experts)
++    flat_ids = raw_topk_ids.to(torch.int64).flatten()
++    in_range = (flat_ids >= 0) & (flat_ids < expert_count)
++    per_expert_m = torch.bincount(
++        flat_ids[in_range], minlength=expert_count
++    ).cpu()
++    raw_m = int(valid_rows.sum().item())
++    mega_padded_m = 0 if raw_m == 0 else 1 << (raw_m - 1).bit_length()
++    component = "dspark" if expert_count == 128 else "backbone"
++    phase, phase_metadata = _shape_capture_metadata()
++    if component == "dspark":
++        phase = f"dspark_{phase}"
++    layer = str(runner.layer_name)
++    capture_raw_ids = (
++        layer.endswith(".layers.0.ffn.experts")
++        if component == "backbone"
++        else layer.endswith(".layers.40.ffn.experts")
++    )
++
++    global _SHAPE_CAPTURE_EVENT
++    event = {
++        "event_index": _SHAPE_CAPTURE_EVENT,
++        "time_ns": time.time_ns(),
++        "layer": layer,
++        "component": component,
++        "phase": phase,
++        "phase_metadata": phase_metadata,
++        "raw_m": raw_m,
++        "padded_m": padded_m,
++        "mega_padded_m": mega_padded_m,
++        "topk": int(topk_ids.shape[1]),
++        "expert_count": expert_count,
++        "invalid_route_count": int((~in_range).sum().item()),
++        "raw_topk_ids_captured": capture_raw_ids,
++        "topk_ids": raw_topk_ids.cpu().tolist() if capture_raw_ids else None,
++        "per_expert_m": per_expert_m.tolist(),
++    }
++    _SHAPE_CAPTURE_EVENT += 1
++    encoded = (json.dumps(event, separators=(",", ":")) + "\n").encode()
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++    try:
++        os.write(fd, encoded)
++    finally:
++        os.close(fd)
++
+@@ -622,0 +764 @@
++            _capture_moe_shape(self, topk_ids)
