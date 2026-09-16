@@ -32,7 +32,7 @@ Directionally passing child plan:
 
 - [MTPR=16384 dominant-prefill coverage](./05_DSV41_FLASH_MEGAMOE_MTPR16384.md)
 
-Next child plan:
+Executed confirmation plan, stopped at tail gate:
 
 - [MTPR=16384 AgentX confirmation](./06_DSV41_FLASH_MEGAMOE_AGENTX_CONFIRMATION.md)
 
@@ -43,12 +43,14 @@ Validated continuation evidence:
 The vLLM adapter child completed implementation, TP4/EP4/DSpark path
 attribution, graph fallback, and the directional matched smoke. The two-request
 hybrid comparison missed the regression gate, so the three 1200-second
-repetitions were not started. Follow-up profiling found that Mega covered only
-1.86% of observed non-capture layer calls; dominant M≈16K prefill chunks
-remained above the MTPR=8192 workspace limit. Plan 05
+MTPR=8192 repetitions were not started. Follow-up profiling found that Mega
+covered only 1.86% of observed non-capture layer calls; dominant M≈16K prefill
+chunks remained above the MTPR=8192 workspace limit. Plan 05
 validated a 16384-token pool at +43% operator speed and raised observed
 non-capture coverage to 91.93%. Its two-request matched smoke improved P90
-normalized interactivity by 3.20%; plan 06 owns longer confirmation.
+normalized interactivity by 3.20%. Plan 06's three 1200-second pairs retained a
++2.63% median P90 normalized-interactivity gain, but ITL P99 regressed 2.21%;
+canonical confirmation and KEEP were stopped.
 
 ## 2. Branch and source baseline
 

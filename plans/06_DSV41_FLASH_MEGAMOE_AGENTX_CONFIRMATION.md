@@ -6,7 +6,50 @@
 > [MegaMoE + AgentX master plan](./01_DSV41_FLASH_MEGAMOE_AGENTX.md).
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **next**
+Status: **stopped at fast-pair ITL P99 gate**
+
+## 0. Execution result (2026-09-16)
+
+Completed three serial 1200-second control/candidate pairs. Every arm completed
+237 profiling requests with zero request errors, clean shutdown, and zero
+residual VRAM.
+
+Median candidate improvement:
+
+- P90 normalized interactivity: +2.63% — pass;
+- TTFT P90: +2.55% — pass;
+- E2EL P90: +0.13% — pass;
+- ITL P90: +0.85% — pass;
+- output throughput: −0.09% — pass;
+- active-GPU mean power: −0.29%;
+- ITL P99: **−2.21% — fail**.
+
+Two of three pairs passed the primary normalized-interactivity gate. Pairwise
+ITL P99 candidate changes were −2.21%, −15.84%, and +4.77%, so the median
+exceeds the permitted +1% regression.
+
+Per-request matching found only +0.049/+0.015/+0.007 ms median ITL changes
+across the three pairs, but a small set of requests regressed by 5–34 ms and
+drives the failed P99. The tail risk is not a broad decode slowdown, but it is
+large enough that the gate cannot be waived.
+
+All ranks reported identical path counters and one workspace:
+
+- pair 1: 5,960 Mega calls, 37.25% non-capture coverage;
+- pair 2: 5,840 Mega calls, 36.23% coverage;
+- pair 3: 5,920 Mega calls, 36.91% coverage.
+
+Long-run coverage is lower than the directional smoke because approximately
+9,600 mixed-phase layer calls per run correctly remain on ordinary Mori+AITER.
+
+Power collection observed all eight physical GPUs instead of the four visible
+model GPUs, so built-in validation reports `expected_gpu_count_mismatch`.
+Filtered GPU 0–3 estimates show 0.18–0.64% lower candidate power.
+
+Per the stop gate, block-rejection accuracy, the 3600-second pair, and
+concurrency widening were not started. The candidate is not approved for KEEP.
+Durable evidence is under
+`/home/jiaweche/dsv41-megamoe-validation-20260915/mtpr16384/confirmation/`.
 
 ## 1. Objective
 
