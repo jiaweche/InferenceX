@@ -28,16 +28,27 @@ Executed child plan, stopped before long A/B:
 
 - [Selective vLLM MegaMoEV2 adapter](./04_DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md)
 
+Directionally passing child plan:
+
+- [MTPR=16384 dominant-prefill coverage](./05_DSV41_FLASH_MEGAMOE_MTPR16384.md)
+
+Next child plan:
+
+- [MTPR=16384 AgentX confirmation](./06_DSV41_FLASH_MEGAMOE_AGENTX_CONFIRMATION.md)
+
 Validated continuation evidence:
 
 - [Ruby handoff and measured shape/A-B results](./02_DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md)
 
 The vLLM adapter child completed implementation, TP4/EP4/DSpark path
 attribution, graph fallback, and the directional matched smoke. The two-request
-hybrid comparison missed the regression gate, so plan 05 was not created and
-the three 1200-second repetitions were not started. Follow-up profiling found
-that Mega covered only 1.86% of observed non-capture layer calls; dominant
-M≈16K prefill chunks remained above the MTPR=8192 workspace limit.
+hybrid comparison missed the regression gate, so the three 1200-second
+repetitions were not started. Follow-up profiling found that Mega covered only
+1.86% of observed non-capture layer calls; dominant M≈16K prefill chunks
+remained above the MTPR=8192 workspace limit. Plan 05
+validated a 16384-token pool at +43% operator speed and raised observed
+non-capture coverage to 91.93%. Its two-request matched smoke improved P90
+normalized interactivity by 3.20%; plan 06 owns longer confirmation.
 
 ## 2. Branch and source baseline
 

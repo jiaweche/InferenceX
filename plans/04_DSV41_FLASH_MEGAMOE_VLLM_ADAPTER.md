@@ -341,12 +341,12 @@ Stop before AgentX if:
 
 ## 12. Next step after this plan
 
-After the three matched fast A/B repetitions pass, create:
+The MTPR=8192 serving gate did not pass. Profiling selected the coverage
+experiment:
 
 ```text
-plans/05_DSV41_FLASH_MEGAMOE_AGENTX_CONFIRMATION.md
+plans/05_DSV41_FLASH_MEGAMOE_MTPR16384.md
 ```
 
-That plan owns the canonical 3600-second matched confirmation, concurrency
-widening, real DSpark block-rejection accuracy, final KEEP/REVERT decision, and
-performance changelog.
+Only if that experiment passes will plan 06 own long AgentX confirmation,
+concurrency widening, accuracy, and the final KEEP/REVERT decision.

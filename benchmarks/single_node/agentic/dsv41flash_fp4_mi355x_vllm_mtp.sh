@@ -134,11 +134,17 @@ VLLM_CMD=(
     --disable-uvicorn-access-log
 )
 if (( force_mori_all2all )); then
-    VLLM_CMD+=(--enable-expert-parallel --all2all-backend mori_high_throughput)
+    VLLM_CMD+=(
+        --enable-expert-parallel
+        --all2all-backend mori_high_throughput
+        # The full 16,384-token compile warmup faults inside sparse attention
+        # before serving. Prefill remains eager; decode retains full graphs.
+        --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+    )
     if (( aiter_mega_moe_v2 )); then
         VLLM_CMD+=(
             --kernel-config
-            '{"enable_aiter_mega_moe_v2":true,"aiter_mega_moe_v2_max_tokens":8192,"aiter_mega_moe_v2_token_allowlist":[888,889,2625,2626,7100,7101]}'
+            '{"enable_aiter_mega_moe_v2":true,"aiter_mega_moe_v2_max_tokens":16384,"aiter_mega_moe_v2_token_allowlist":[888,889,2625,2626,7100,7101,16376,16380]}'
         )
     else
         VLLM_CMD+=(--kernel-config '{"force_mori_all2all":true}')

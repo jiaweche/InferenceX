@@ -1,12 +1,13 @@
 diff --git a/tests/model_executor/layers/test_aiter_mega_moe_v2.py b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
 new file mode 100644
-index 0000000..424f9a5
+index 0000000..b1fd582
 --- /dev/null
 +++ b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,601 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
++import sys
 +import threading
 +from types import SimpleNamespace
 +
@@ -17,19 +18,24 @@ index 0000000..424f9a5
 +from vllm.config import CUDAGraphMode, KernelConfig
 +from vllm.distributed.device_communicators.all2all import MoriAll2AllManager
 +from vllm.forward_context import ForwardContext
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 +from vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2 import (
 +    AiterMegaMoEV2Adapter,
 +    AiterMegaMoEV2Decision,
++    _validate_static_configuration,
 +    select_aiter_mega_moe_v2_local,
 +)
 +from vllm.model_executor.layers.fused_moe.config import (
 +    FusedMoEParallelConfig,
 +    FusedMoEQuantConfig,
 +)
++from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 +from vllm.model_executor.layers.fused_moe.prepare_finalize.mori import (
 +    MoriPrepareAndFinalize,
 +)
 +from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
++
++_TOKEN_ALLOWLIST = (888, 889, 2625, 2626, 7100, 7101, 16376, 16380)
 +
 +
 +def _metadata(
@@ -82,6 +88,24 @@ index 0000000..424f9a5
 +            "eligible",
 +        ),
 +        (
++            _context(_metadata(num_prefill_tokens=16376)),
++            16376,
++            True,
++            "eligible",
++        ),
++        (
++            _context(_metadata(num_prefill_tokens=16380)),
++            16380,
++            True,
++            "eligible",
++        ),
++        (
++            _context(_metadata(num_prefill_tokens=16379)),
++            16379,
++            False,
++            "unlisted_m",
++        ),
++        (
 +            _context(
 +                _metadata(
 +                    num_decodes=1,
@@ -117,7 +141,7 @@ index 0000000..424f9a5
 +    decision = select_aiter_mega_moe_v2_local(
 +        context,
 +        raw_m,
-+        (888, 889, 2625, 2626, 7100, 7101),
++        _TOKEN_ALLOWLIST,
 +    )
 +
 +    assert decision.eligible is expected
@@ -131,7 +155,7 @@ index 0000000..424f9a5
 +    decision = select_aiter_mega_moe_v2_local(
 +        context,
 +        888,
-+        (888, 889, 2625, 2626, 7100, 7101),
++        _TOKEN_ALLOWLIST,
 +    )
 +
 +    assert decision == AiterMegaMoEV2Decision(
@@ -152,7 +176,7 @@ index 0000000..424f9a5
 +    decision = select_aiter_mega_moe_v2_local(
 +        _context(),
 +        888,
-+        (888, 889, 2625, 2626, 7100, 7101),
++        _TOKEN_ALLOWLIST,
 +    )
 +
 +    assert decision == AiterMegaMoEV2Decision(
@@ -167,7 +191,7 @@ index 0000000..424f9a5
 +        KernelConfig(aiter_mega_moe_v2_max_tokens=7000)
 +    with pytest.raises(ValidationError, match="must not contain duplicates"):
 +        KernelConfig(aiter_mega_moe_v2_token_allowlist=(888, 888))
-+    with pytest.raises(ValidationError, match="requires max tokens 8192"):
++    with pytest.raises(ValidationError, match="requires max tokens 16384"):
 +        KernelConfig(
 +            enable_aiter_mega_moe_v2=True,
 +            aiter_mega_moe_v2_max_tokens=4096,
@@ -177,6 +201,48 @@ index 0000000..424f9a5
 +            enable_aiter_mega_moe_v2=True,
 +            aiter_mega_moe_v2_token_allowlist=(888,),
 +        )
++
++
++def test_static_config_rejects_scheduler_below_mtpr(monkeypatch) -> None:
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "current_platform.is_rocm",
++        lambda: True,
++    )
++    monkeypatch.setitem(
++        sys.modules,
++        "vllm.platforms.rocm",
++        SimpleNamespace(on_gfx950=lambda: True),
++    )
++    parallel = SimpleNamespace(
++        use_ep=True,
++        ep_size=4,
++        dp_size=1,
++        pcp_size=1,
++        is_sequence_parallel=False,
++        use_mori_kernels=True,
++        enable_eplb=False,
++    )
++    moe = SimpleNamespace(
++        moe_parallel_config=parallel,
++        hidden_dim=5120,
++        intermediate_size_per_partition=2304,
++        num_local_experts=96,
++        activation=MoEActivation.SILU,
++        max_num_tokens=8192,
++    )
++    vllm_config = SimpleNamespace(
++        kernel_config=KernelConfig(),
++        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
++    )
++
++    errors = _validate_static_configuration(
++        moe,
++        Mxfp4MoeBackend.AITER_MXFP4_BF16,
++        vllm_config,
++    )
++
++    assert errors == ["scheduler token capacity is smaller than MegaMoEV2 MTPR"]
 +
 +
 +def test_forced_tp_ep_uses_mori_alltoall() -> None:
@@ -397,7 +463,7 @@ index 0000000..424f9a5
 +def _adapter_for_apply(decision: AiterMegaMoEV2Decision):
 +    adapter = object.__new__(AiterMegaMoEV2Adapter)
 +    adapter.workspace_key = ("workspace",)
-+    adapter.max_tokens = 8192
++    adapter.max_tokens = 16384
 +    adapter.moe = SimpleNamespace(
 +        hidden_dim=2,
 +        intermediate_size_per_partition=1,
@@ -540,7 +606,7 @@ index 0000000..424f9a5
 +        "unregister:mori",
 +    ]
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index a6dddc3..e20960a 100644
+index a6dddc3..7083781 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
@@ -552,7 +618,7 @@ index a6dddc3..e20960a 100644
  
  from vllm.config.utils import config, get_hash_factors, hash_factors
  from vllm.logger import init_logger
-@@ -267,6 +267,33 @@ class KernelConfig:
+@@ -267,6 +267,35 @@ class KernelConfig:
                     running QDQ on activations.
      """
  
@@ -570,7 +636,7 @@ index a6dddc3..e20960a 100644
 +    adapter. It requires expert parallel and a Mori all-to-all backend.
 +    """
 +
-+    aiter_mega_moe_v2_max_tokens: int = 8192
++    aiter_mega_moe_v2_max_tokens: int = 16384
 +    """Power-of-two maximum tokens per rank for the pooled MegaMoEV2 workspace."""
 +
 +    aiter_mega_moe_v2_token_allowlist: tuple[int, ...] = (
@@ -580,13 +646,15 @@ index a6dddc3..e20960a 100644
 +        2626,
 +        7100,
 +        7101,
++        16376,
++        16380,
 +    )
 +    """Exact unpadded pure-prefill token counts eligible for MegaMoEV2."""
 +
      linear_backend: LinearBackend = "auto"
      """Backend for linear layer GEMM kernels. Available options:
  
-@@ -303,6 +330,52 @@ class KernelConfig:
+@@ -303,6 +332,54 @@ class KernelConfig:
              return value.lower().replace("-", "_")
          return value
  
@@ -618,9 +686,9 @@ index a6dddc3..e20960a 100644
 +    def _validate_fixed_aiter_mega_moe_v2_rollout(self):
 +        if not self.enable_aiter_mega_moe_v2:
 +            return self
-+        if self.aiter_mega_moe_v2_max_tokens != 8192:
++        if self.aiter_mega_moe_v2_max_tokens != 16384:
 +            raise ValueError(
-+                "the first AITER MegaMoEV2 rollout requires max tokens 8192"
++                "the MTPR=16384 MegaMoEV2 rollout requires max tokens 16384"
 +            )
 +        if self.aiter_mega_moe_v2_token_allowlist != (
 +            888,
@@ -629,10 +697,12 @@ index a6dddc3..e20960a 100644
 +            2626,
 +            7100,
 +            7101,
++            16376,
++            16380,
 +        ):
 +            raise ValueError(
-+                "the first AITER MegaMoEV2 rollout requires token allowlist "
-+                "(888, 889, 2625, 2626, 7100, 7101)"
++                "the MTPR=16384 MegaMoEV2 rollout requires token allowlist "
++                "(888, 889, 2625, 2626, 7100, 7101, 16376, 16380)"
 +            )
 +        return self
 +

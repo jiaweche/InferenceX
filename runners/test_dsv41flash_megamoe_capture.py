@@ -78,12 +78,16 @@ builtin source "$1/benchmarks/single_node/agentic/dsv41flash_fp4_mi355x_vllm_mtp
     assert "--enforce-eager" in args
     assert "--enable-expert-parallel" in args
     assert args[args.index("--all2all-backend") + 1] == "mori_high_throughput"
+    assert json.loads(args[args.index("--compilation-config") + 1]) == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+    }
     assert args[args.index("--max-cudagraph-capture-size") + 1] == "128"
     assert args[args.index("--gpu-memory-utilization") + 1] == "0.8"
     kernel_config = json.loads(args[args.index("--kernel-config") + 1])
     assert kernel_config == {
         "enable_aiter_mega_moe_v2": True,
-        "aiter_mega_moe_v2_max_tokens": 8192,
+        "aiter_mega_moe_v2_max_tokens": 16384,
         "aiter_mega_moe_v2_token_allowlist": [
             888,
             889,
@@ -91,6 +95,8 @@ builtin source "$1/benchmarks/single_node/agentic/dsv41flash_fp4_mi355x_vllm_mtp
             2626,
             7100,
             7101,
+            16376,
+            16380,
         ],
     }
     assert (tmp_path / "capture_seen.txt").read_text().strip() == str(capture_file)
