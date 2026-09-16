@@ -6,7 +6,7 @@
 > [MegaMoE + AgentX master plan](./01_DSV41_FLASH_MEGAMOE_AGENTX.md).
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **smoke complete; stopped before 1200-second A/B**
+Status: **smoke and bottleneck profile complete; stopped before 1200-second A/B**
 
 ## 0. Execution result (2026-09-16)
 
@@ -54,6 +54,27 @@ This misses the >1% P90 improvement and <1% regression-risk gates. Per the stop
 conditions, the three 1200-second repetitions and plan 05 were not started.
 Durable evidence is under
 `/home/jiaweche/dsv41-megamoe-validation-20260915/vllm-adapter/`.
+
+### Bottleneck profile
+
+The two-request P90s are not tail estimates: their absolute candidate-control
+differences were −16.997 ms request latency, +1.074 ms TTFT, and +0.538 ms ITL.
+
+A matched eager torch profile found:
+
+- eligible request wall time improved 6.12% at M=889, 1.27% at M=2626, and
+  5.39% at M=7101;
+- total self CUDA time improved 6.91%;
+- integrated `moe_forward_shared` CUDA time improved only 1.95%;
+- decode-generation GPU time changed by only +0.27%;
+- eager rank agreement costs 0.305 ms, but hybrid graph replay bypasses it;
+- Mega covered only 120 of 6,440 observed non-capture layer calls (1.86%).
+
+The dominant bottleneck is coverage. The trace had 5,960 ordinary unlisted
+calls, primarily M≈16,376–16,380 chunks above MTPR=8192. Shared-expert overlap
+and Mega Stage2/combine then hide most of the isolated operator gain on eligible
+shapes. The next useful experiment is MTPR=16384 or an 8192 scheduler chunk cap,
+not a longer serving A/B of the current selector.
 
 ## 1. Objective
 

@@ -35,7 +35,9 @@ Validated continuation evidence:
 The vLLM adapter child completed implementation, TP4/EP4/DSpark path
 attribution, graph fallback, and the directional matched smoke. The two-request
 hybrid comparison missed the regression gate, so plan 05 was not created and
-the three 1200-second repetitions were not started.
+the three 1200-second repetitions were not started. Follow-up profiling found
+that Mega covered only 1.86% of observed non-capture layer calls; dominant
+M≈16K prefill chunks remained above the MTPR=8192 workspace limit.
 
 ## 2. Branch and source baseline
 
