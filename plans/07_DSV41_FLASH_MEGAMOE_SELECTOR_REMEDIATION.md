@@ -6,9 +6,9 @@
 > [MegaMoE + AgentX master plan](./01_DSV41_FLASH_MEGAMOE_AGENTX.md).
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **fast confirmation in progress**
+Status: **stopped at canonical ITL P90 gate**
 
-## 0. Execution progress (2026-09-16)
+## 0. Execution result (2026-09-16)
 
 Implementation and trace gates pass.
 
@@ -37,6 +37,46 @@ iteration:
 
 Durable implementation and trace receipts are under
 `/home/jiaweche/dsv41-megamoe-validation-20260915/mtpr16384/remediation/`.
+
+Three 1200-second pairs completed 237 profiled requests per arm with zero
+errors. Median candidate changes:
+
+- P90 normalized interactivity: +6.13%;
+- TTFT P90: +2.24%;
+- E2EL P90: −0.38%;
+- ITL P90: +1.16%;
+- ITL P99: +5.35%;
+- output throughput: +0.04%;
+- active GPU 0–3 power: −0.33%.
+
+All fast-pair median gates pass, including two of three primary interactivity
+passes. Median candidate routing coverage is 37.37%; all rank receipts are
+identical and contain zero rank disagreements.
+
+Full 1,319-example GSM8K with real DSpark block rejection also passes:
+candidate exact match is 0.9727 flexible / 0.9735 strict versus control
+0.9704 / 0.9712.
+
+The canonical pair retains the primary gain but narrowly fails the strict ITL
+P90 gate:
+
+- P90 normalized interactivity: +3.59%;
+- TTFT P90: +6.51%;
+- E2EL P90: −0.03%;
+- ITL P90: **−1.03%**;
+- ITL P99: −0.08%;
+- output throughput: −0.06%;
+- active GPU 0–3 power: −0.21%.
+
+The original ITL P99 regression is removed, but ITL P90 exceeds the allowed
+regression by approximately 0.03 percentage points. Per the stop gate,
+concurrency widening was not started and the candidate is not approved for
+canonical KEEP.
+
+The AgentX corpus is finite: the nominal 3600-second pair produced the same 237
+profiled requests and approximately 1,226 seconds of active workload as each
+fast arm. The remaining wall time added no samples, so a future long
+confirmation must explicitly repeat the corpus.
 
 ## 1. Objective
 

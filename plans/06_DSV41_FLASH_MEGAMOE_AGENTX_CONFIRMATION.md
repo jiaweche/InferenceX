@@ -73,6 +73,10 @@ The next candidate should evaluate CPU phase/M metadata before touching the
 padding tensor and replace two min/max reductions with one gathered agreement.
 This must be implemented and re-confirmed before revisiting canonical KEEP.
 
+[Plan 07](./07_DSV41_FLASH_MEGAMOE_SELECTOR_REMEDIATION.md) implemented that
+remediation. It removed the ITL P99 stop, but canonical ITL P90 regressed 1.03%
+and still prevented KEEP.
+
 ## 1. Objective
 
 Determine whether the MTPR=16384 selective MegaMoEV2 adapter produces a
