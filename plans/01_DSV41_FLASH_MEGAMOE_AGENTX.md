@@ -24,7 +24,7 @@ Completed child plan:
 
 - [Pooled AITER workspace and explicit teardown](./03_DSV41_FLASH_MEGAMOE_POOLED_AITER_WORKSPACE.md)
 
-Current child plan:
+Executed child plan, stopped before long A/B:
 
 - [Selective vLLM MegaMoEV2 adapter](./04_DSV41_FLASH_MEGAMOE_VLLM_ADAPTER.md)
 
@@ -32,8 +32,10 @@ Validated continuation evidence:
 
 - [Ruby handoff and measured shape/A-B results](./02_DSV41_FLASH_MEGAMOE_RUBY_HANDOFF.md)
 
-The vLLM adapter child owns the prefill-only integration and matched serving
-A/B. It may advance to indexed plan 05 only after those gates pass.
+The vLLM adapter child completed implementation, TP4/EP4/DSpark path
+attribution, graph fallback, and the directional matched smoke. The two-request
+hybrid comparison missed the regression gate, so plan 05 was not created and
+the three 1200-second repetitions were not started.
 
 ## 2. Branch and source baseline
 

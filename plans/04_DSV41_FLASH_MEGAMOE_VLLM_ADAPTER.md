@@ -6,7 +6,54 @@
 > [MegaMoE + AgentX master plan](./01_DSV41_FLASH_MEGAMOE_AGENTX.md).
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **next**
+Status: **smoke complete; stopped before 1200-second A/B**
+
+## 0. Execution result (2026-09-16)
+
+Implemented and validated:
+
+- vLLM adapter commit
+  `e01a3fe5ee727903c296379677ca31faf5d1accc`;
+- AITER compatibility commit
+  `22c82955b41e2b482a99290537a044e6964499b1`;
+- one model-load-finalized workspace per EP rank: 39 symmetric allocations,
+  1,695,265,648 bytes;
+- rank-cached eager selection and unconditional graph, decode, DSpark, mixed,
+  padded, unknown, and unlisted fallback, with DBO rejected at startup;
+- source routing preservation for the current MoRI `combine()` API;
+- collective workspace teardown before MoRI SHMEM finalization;
+- immutable image
+  `dsv41-megamoe-adapter:vllm-e01a3fe-aiter-22c8295`
+  (`sha256:1d32c46232fcdd2924449f3dd60737cf008ba62c2a2438e7ee26875f8849695a`).
+
+Reproducibility patch hashes:
+
+- vLLM: `6984c3e13f5af046f60d7adf31275599d6859bf36c6d775125e14a0721429cee`;
+- AITER: `c1f473b14ca6577fbf6553a77e44b211e24b1bf3b300e33d3cf465dc51948137`;
+- MoRI: `fda470170f801d05ce68fcd19647e546c3c5f045f03e0244e22606af415c0b97`.
+
+The first hybrid replay showed that AgentX chat adds one token relative to the
+earlier eager capture. The exact allowlist was therefore extended only to the
+observed pairs `888/889`, `2625/2626`, and `7100/7101`; TP4 operator tests
+passed for all three +1 shapes.
+
+The final hybrid candidate selected Mega exactly 40 times for each of M=889,
+2626, and 7101 and zero times elsewhere. Every rank reported identical path
+counters. Graph capture used ordinary Mori+AITER through the explicit
+`stream_capture` fallback.
+
+The matched 60-second directional smoke completed only two profiling requests
+per arm, so it is not statistically useful. Candidate versus control was:
+
+- request-latency average: +0.70%; P90: -0.14%;
+- TTFT average: +3.96%; P90: +0.11%;
+- ITL average: +1.48%; P90: +2.43%;
+- request errors: zero in both arms.
+
+This misses the >1% P90 improvement and <1% regression-risk gates. Per the stop
+conditions, the three 1200-second repetitions and plan 05 were not started.
+Durable evidence is under
+`/home/jiaweche/dsv41-megamoe-validation-20260915/vllm-adapter/`.
 
 ## 1. Objective
 
@@ -24,11 +71,12 @@ Use:
 ```text
 vLLM:
   /scratch/jiaweche/dsv41-megamoe/vllm-src
-  eed1f3d0c6043bd494424a22443ee198dd56f657
+  base: eed1f3d0c6043bd494424a22443ee198dd56f657
+  adapter: e01a3fe5ee727903c296379677ca31faf5d1accc
 
 AITER:
   /scratch/jiaweche/dsv41-megamoe/aiter-vllm
-  e4b600af4ed97453a325711e2fc2aee0ebeb5239
+  adapter: 22c82955b41e2b482a99290537a044e6964499b1
 
 MoRI library SHA256:
   3df6da1342f1c9dc7923fd2620bb132b283b2063bf0040a88cb08056e136cfd5
@@ -85,7 +133,7 @@ The configuration must carry:
 ```text
 enabled: false by default
 candidate MTPR: 8192
-exact allowed raw M values: 888, 2625, 7100
+exact allowed raw M values: 888/889, 2625/2626, 7100/7101
 required global experts: 384
 required top-k: 6
 required model/intermediate dimensions: 5120/2304
@@ -97,6 +145,7 @@ Startup must reject an enabled adapter when:
 - expert parallel is disabled;
 - EP world size is not four;
 - DP, PP, PCP, or sequence parallel exceeds one;
+- dual-batch overlap is enabled;
 - the all-to-all backend is not intranode MoRI;
 - EPLB or redundant experts are enabled;
 - the MXFP4 backend does not produce AITER A16W4 shuffled weights;
@@ -122,7 +171,7 @@ Candidate eligibility requires:
 - zero decode rows and at least one prefill row;
 - no mixed or extend phase;
 - no padding rows;
-- unpadded raw M is exactly 888, 2625, or 7100;
+- unpadded raw M is exactly 888/889, 2625/2626, or 7100/7101;
 - the model is the 384-expert, top-k-6 backbone, not DSpark;
 - every EP rank agrees on phase, M, and eligibility.
 
@@ -205,7 +254,8 @@ Emit counters by component, phase, raw M, selected path, and fallback reason.
 
 The first 60-second replay must prove:
 
-- Mega calls occur only for backbone M=888, 2625, and 7100 pure prefill;
+- Mega calls occur only for backbone M=888/889, 2625/2626, and 7100/7101
+  pure prefill;
 - zero Mega calls occur for backbone decode and DSpark;
 - all ranks report identical decisions and call counts;
 - exactly one workspace is allocated per rank;

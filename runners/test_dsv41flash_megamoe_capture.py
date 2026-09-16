@@ -26,6 +26,8 @@ def test_shape_capture_forces_eager_and_opens_gate_at_profiling(
         "VLLM_MOE_SHAPE_CAPTURE": "1",
         "VLLM_MOE_SHAPE_CAPTURE_PATH": str(capture_file),
         "VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE": str(active_file),
+        "VLLM_AITER_MEGA_MOE_V2": "1",
+        "VLLM_GPU_MEMORY_UTILIZATION": "0.8",
     }
     result = subprocess.run(
         [
@@ -74,5 +76,22 @@ builtin source "$1/benchmarks/single_node/agentic/dsv41flash_fp4_mi355x_vllm_mtp
     assert result.returncode == 0, result.stderr
     args = json.loads((tmp_path / "args.json").read_text())
     assert "--enforce-eager" in args
+    assert "--enable-expert-parallel" in args
+    assert args[args.index("--all2all-backend") + 1] == "mori_high_throughput"
+    assert args[args.index("--max-cudagraph-capture-size") + 1] == "128"
+    assert args[args.index("--gpu-memory-utilization") + 1] == "0.8"
+    kernel_config = json.loads(args[args.index("--kernel-config") + 1])
+    assert kernel_config == {
+        "enable_aiter_mega_moe_v2": True,
+        "aiter_mega_moe_v2_max_tokens": 8192,
+        "aiter_mega_moe_v2_token_allowlist": [
+            888,
+            889,
+            2625,
+            2626,
+            7100,
+            7101,
+        ],
+    }
     assert (tmp_path / "capture_seen.txt").read_text().strip() == str(capture_file)
     assert not active_file.exists()

@@ -1,0 +1,8 @@
+FROM vllm/vllm-openai-rocm:nightly-eed1f3d0c6043bd494424a22443ee198dd56f657
+
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+COPY aiter/ops/flydsl/kernels/tensor_shim.py /usr/local/lib/python3.12/dist-packages/aiter/ops/flydsl/kernels/tensor_shim.py
+COPY aiter/ops/flydsl/kernels/communication_ops_utils.py /usr/local/lib/python3.12/dist-packages/aiter/ops/flydsl/kernels/communication_ops_utils.py
+COPY aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py /usr/local/lib/python3.12/dist-packages/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
+COPY aiter/ops/flydsl/kernels/mega_moe/ /usr/local/lib/python3.12/dist-packages/aiter/ops/flydsl/kernels/mega_moe/
+COPY mori/ /usr/local/lib/python3.12/dist-packages/mori/

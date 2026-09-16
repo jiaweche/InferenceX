@@ -2,9 +2,18 @@ diff --git a/aiter/ops/comm_fused_moe_runtime.py b/aiter/ops/comm_fused_moe_runt
 index 8528a52..54a698b 100644
 --- a/aiter/ops/comm_fused_moe_runtime.py
 +++ b/aiter/ops/comm_fused_moe_runtime.py
-@@ -7,0 +8 @@ from collections.abc import Callable
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Callable
 +from dataclasses import replace
-@@ -91,0 +93,13 @@ class CommFusedMoeRuntime:
+ from typing import Any
+ 
+ import torch
+@@ -89,8 +90,22 @@ class CommFusedMoeRuntime:
+             caller_stream.wait_stream(stage2_stream)
+             return output
+ 
 +        metadata_transform = None
 +        if getattr(runner, "requires_token_major_stage2_input", False):
 +
@@ -18,13 +27,20 @@ index 8528a52..54a698b 100644
 +                    return metadata
 +                return replace(metadata, skip_inter_quant=False)
 +
-@@ -93,0 +108 @@ class CommFusedMoeRuntime:
+         output = _fused_moe_impl(
+             **moe_args,
 +            _metadata_transform=metadata_transform,
+             _stage2_override=stage2_override,
+         )
+         return output if raw_tokens == bucket else output[:raw_tokens]
 diff --git a/aiter/ops/flydsl/comm_fused_moe_host.py b/aiter/ops/flydsl/comm_fused_moe_host.py
 index e9a0e0b..1df7162 100644
 --- a/aiter/ops/flydsl/comm_fused_moe_host.py
 +++ b/aiter/ops/flydsl/comm_fused_moe_host.py
-@@ -438 +438,19 @@ def _stage2_args(args, kwargs, config):
+@@ -435,7 +435,25 @@ def _stage2_args(args, kwargs, config):
+     )
+ 
+ 
 -class _AtomicRunner:
 +class _CommunicatorRunner:
 +    """Own and deterministically release one runner's MoRI resources."""
@@ -45,42 +61,105 @@ index e9a0e0b..1df7162 100644
 +class _AtomicRunner(_CommunicatorRunner):
 +    requires_token_major_stage2_input = False
 +
-@@ -536 +554 @@ class _AtomicRunner:
+     def __init__(
+         self,
+         tp_group,
+@@ -533,9 +551,11 @@ class _AtomicRunner:
+         return self.output
+ 
+ 
 -class _MegakernelRunner:
 +class _MegakernelRunner(_CommunicatorRunner):
-@@ -538,0 +557,2 @@ class _MegakernelRunner:
+     """Single-launch GEMM2 with per-N-tile TP collective services."""
+ 
 +    requires_token_major_stage2_input = True
 +
-@@ -635 +655,3 @@ class _MegakernelRunner:
+     def __init__(
+         self,
+         tp_group,
+@@ -632,7 +652,9 @@ class _MegakernelRunner:
+         return self.output
+ 
+ 
 -class _WindowRunner:
 +class _WindowRunner(_CommunicatorRunner):
 +    requires_token_major_stage2_input = True
 +
-@@ -868,0 +891,5 @@ class _LazyRunners:
+     def __init__(
+         self,
+         tp_group,
+@@ -866,6 +888,11 @@ class _LazyRunners:
+             self.instances[tokens] = create_runner(self.tp_group, config)
+         return self.instances[tokens]
+ 
 +    def close(self) -> None:
 +        for runner in reversed(tuple(self.instances.values())):
 +            runner.close()
 +        self.instances.clear()
 +
+ 
+ def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts, topk):
+     shape = ShapeKey(
 diff --git a/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py b/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
-index f7f1ed3..2ede91a 100644
+index f7f1ed3..873aba3 100644
 --- a/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
 +++ b/aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py
-@@ -410,0 +411,2 @@ class FlyDSLDispatchGroupMajorOp:
+@@ -24,7 +24,7 @@ from .flydsl_dispatch_combine_intranode_kernel import (
+     make_combine_jit,
+     make_dispatch_jit,
+ )
+-from .tensor_shim import _preload_compiled
++from .mega_moe.preload import preload_compiled as _preload_compiled
+ 
+ # Reject unsupported token dtypes at construction, not deep in JIT codegen.
+ _SUPPORTED_TOK_DTYPES = (
+@@ -145,7 +145,14 @@ def resolve_tuning_config_path(
+     del ep_size, kernel_type
+     from aiter.jit.core import AITER_CONFIGS
+ 
+-    path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
++    config_file = getattr(
++        AITER_CONFIGS,
++        "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE",
++        None,
++    )
++    if config_file is None:
++        return None
++    path = Path(config_file)
+     return path if path.is_file() else None
+ 
+ 
+@@ -408,6 +415,8 @@ class FlyDSLDispatchGroupMajorOp:
+         self.scale_bytes = scale_dim * scale_type_size
+         self.scale_n_i32 = (self.scale_bytes + 3) // 4 if self.scale_bytes > 0 else 0
+         self._dev = torch.device("cuda", rank)
 +        self._closed = False
 +        self._owned_symmetric_tensors = []
-@@ -438,0 +441,2 @@ class FlyDSLDispatchGroupMajorOp:
+         self.row_bytes = _token_bytes_for(data_type, hidden_dim)
+         self.row_view = _token_view_dim_for(data_type, hidden_dim)
+ 
+@@ -436,6 +445,8 @@ class FlyDSLDispatchGroupMajorOp:
+ 
+     def _sym(self, shape, dtype):
+         t = mori_shmem_create_tensor(shape, dtype)
 +        label = f"{type(self).__name__}[{len(self._owned_symmetric_tensors)}]"
 +        self._owned_symmetric_tensors.append((label, t))
-@@ -560,0 +565,31 @@ class FlyDSLDispatchGroupMajorOp:
+         t.zero_()
+         return t
+ 
+@@ -558,15 +569,52 @@ class FlyDSLDispatchGroupMajorOp:
+             "dedup_rx": None,
+         }
+ 
 +    @property
 +    def symmetric_allocation_count(self):
 +        return len(self._owned_symmetric_tensors)
-+
+ 
+-class FlyDSLDispatchCombineIntraNodeOp:
 +    @property
 +    def symmetric_allocation_nbytes(self):
 +        return sum(tensor.nbytes for _, tensor in self._owned_symmetric_tensors)
-+
+ 
 +    def close(self):
 +        if self._closed and not self._owned_symmetric_tensors:
 +            return
@@ -104,34 +183,56 @@ index f7f1ed3..2ede91a 100644
 +                self._owned_symmetric_tensors.pop()
 +            torch.cuda.synchronize(self._dev)
 +            ms.shmem_barrier_all()
-@@ -562 +596,0 @@ class FlyDSLDispatchGroupMajorOp:
--class FlyDSLDispatchCombineIntraNodeOp:
-@@ -563,0 +598 @@ class FlyDSLDispatchCombineIntraNodeOp:
++
++
 +class FlyDSLDispatchCombineIntraNodeOp:
-@@ -569,0 +605,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
+     def __init__(self, config):
+         self.cfg = config
+         self._check_config()
+         if config.tuning_table is None:
+             self.load_tuning_config(config.tuning_config_path)
+         self._dev = torch.device("cuda", config.rank)
 +        self._closed = False
 +        self._owned_symmetric_tensors = []
 +        self._gm = None
 +        self._initialize(config)
 +
 +    def _initialize(self, config):
-@@ -644 +684,0 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         r = config.rank
+ 
+         self._alloc_buffers()
+@@ -641,7 +689,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         for _attr, _src in _fx_srcs.items():
+             setattr(self, _attr, fx.Int64(_src.data_ptr()))
+ 
 -        self._gm = None
-@@ -671,0 +712,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         if getattr(config, "enable_group_major", False):
+             self._gm = FlyDSLDispatchGroupMajorOp(
+                 rank=config.rank,
+@@ -669,6 +716,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         self.cfg.tuning_table = build_geometry_tuning_table_for_config(self.cfg, path)
+         return self.cfg.tuning_table
+ 
 +    def _sym(self, shape, dtype):
 +        tensor = mori_shmem_create_tensor(shape, dtype)
 +        label = f"{type(self).__name__}[{len(self._owned_symmetric_tensors)}]"
 +        self._owned_symmetric_tensors.append((label, tensor))
 +        return tensor
 +
-@@ -696,3 +742,3 @@ class FlyDSLDispatchCombineIntraNodeOp:
+     def _alloc_buffers(self):
+         cfg = self.cfg
+         npes = cfg.world_size
+@@ -693,23 +746,19 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         ) // 2  # combine input, worst-case (combine_dtype)
+         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
+ 
 -        self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
 -        self.shmem_disp_out_wts = mori_shmem_create_tensor((mr * k,), torch.float32)
 -        self.shmem_disp_out_idx = mori_shmem_create_tensor((mr * k,), torch.int32)
 +        self.shmem_disp_out_tok = self._sym((tok_i16_mr,), torch.int16)
 +        self.shmem_disp_out_wts = self._sym((mr * k,), torch.float32)
 +        self.shmem_disp_out_idx = self._sym((mr * k,), torch.int32)
-@@ -700,13 +746,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
+         scale_total = mr * cfg.scale_bytes if cfg.scale_bytes > 0 else 1
 -        self.shmem_out_scales = mori_shmem_create_tensor((scale_total,), torch.int8)
 -        self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
 -        self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
@@ -154,7 +255,13 @@ index f7f1ed3..2ede91a 100644
 +        self.shmem_comb_out_tok = self._sym((tok_i16_mt,), torch.int16)
 +        self.shmem_comb_out_wts = self._sym((mt * k,), torch.float32)
 +        self.shmem_xdev_bar_mem = self._sym((npes,), torch.int64)
-@@ -751,0 +794,56 @@ class FlyDSLDispatchCombineIntraNodeOp:
+ 
+         # shmem_malloc is uninitialized; zero what combine reads.
+         self.shmem_tok_id_to_src.zero_()
+@@ -749,6 +798,62 @@ class FlyDSLDispatchCombineIntraNodeOp:
+             )
+             self.disp_grid_bar = torch.zeros(1, dtype=torch.int64, device=self._dev)
+ 
 +    @property
 +    def symmetric_allocation_count(self):
 +        child_count = self._gm.symmetric_allocation_count if self._gm is not None else 0
@@ -211,14 +318,95 @@ index f7f1ed3..2ede91a 100644
 +            torch.cuda.synchronize(self._dev)
 +            ms.shmem_barrier_all()
 +
+     def _check_config(self):
+         """Static check of ``self.cfg``; runs before any GPU alloc."""
+         cfg = self.cfg
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_prepare.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_prepare.py
+index 09b184e..ec47f51 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_prepare.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_prepare.py
+@@ -12,8 +12,9 @@ from flydsl.expr.typing import Vector as Vec
+ from flydsl.runtime.device import get_rocm_arch
+ 
+ from .. import communication_ops_utils as comm_ops
+-from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
++from ..tensor_shim import _run_compiled, ptr_buf_tensor
+ from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
++from .preload import preload_compiled as _preload_compiled
+ from .quant import emit_per_1x32_mx_fp8_group
+ 
+ 
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py
+index e76fe3b..7e88003 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py
+@@ -14,7 +14,6 @@ from flydsl.runtime.device import get_rocm_arch
+ 
+ from .. import communication_ops_utils as comm_ops
+ from ..tensor_shim import (
+-    _preload_compiled,
+     _run_compiled,
+     buf_copy_load,
+     ptr_buf_tensor,
+@@ -33,6 +32,7 @@ from .mega_moe_config import (
+     Stage1Config,
+     fixed_stage1_epoch_slot,
+ )
++from .preload import preload_compiled as _preload_compiled
+ 
+ _SC0_CACHE = 1
+ _BUFFER_OFFSET_ABI_BYTES = 1 << 32
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2.py
+index d189254..53b48f2 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2.py
+@@ -16,7 +16,6 @@ from ..mxfp4_gemm_common import (
+     lds_vec_load,
+ )
+ from ..tensor_shim import (
+-    _preload_compiled,
+     _run_compiled,
+     buf_copy_store,
+     ptr_buf_tensor,
+@@ -29,6 +28,7 @@ from .gemm2 import (
+     issue_a_load_lds_dt,
+     kStages,
+ )
++from .preload import preload_compiled as _preload_compiled
+ 
+ _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+ 
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2_aligned_pair.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2_aligned_pair.py
+index 3f5acd4..7c136f7 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2_aligned_pair.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage2_aligned_pair.py
+@@ -19,7 +19,6 @@ from flydsl.runtime.device import get_rocm_arch
+ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
+ from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
+ from ..tensor_shim import (
+-    _preload_compiled,
+     _run_compiled,
+     buf_copy_store,
+     ptr_buf_tensor,
+@@ -34,6 +33,7 @@ from .mega_moe_stage2 import (
+     _fp8_scale_for_leader,
+     _stage2_lds_bytes,
+ )
++from .preload import preload_compiled as _preload_compiled
+ 
+ _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+ ALIGNED_PAIR_SCATTER_VEC = 16
 diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
 index 422260e..367714b 100644
 --- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
 +++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
-@@ -70,0 +71,2 @@ class MegaMoEV2:
+@@ -68,7 +68,23 @@ class MegaMoEV2:
+         if self.swiglu_limit < 0:
+             raise ValueError("swiglu_limit must be non-negative")
+         self.dev = torch.device("cuda", rank)
 +        self._closed = False
 +        self._borrowed_weight_refs = {}
-@@ -71,0 +74,14 @@ class MegaMoEV2:
+         self.max_recv = self.world_size * self.mtpr
 +        bound_weights = tuple(
 +            weight if weight.is_contiguous() else weight.contiguous()
 +            for weight in (w1, w1_scale, w2, w2_scale)
@@ -233,12 +421,21 @@ index 422260e..367714b 100644
 +        # Preserve the public attributes used by existing callers.
 +        self.w2 = self._bound_w2
 +        self.w2_scale = self._bound_w2_scale
-@@ -92,3 +108 @@ class MegaMoEV2:
+         compact = not self._bundle_plan.fixed_slot_dispatch
+         # Compact Stage1 always uses the deterministic runtime fanout protocol.
+         # Keeping this wire format identical for every MAX-MTPR bucket is what
+@@ -89,15 +105,97 @@ class MegaMoEV2:
+         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
+         torch.cuda.synchronize()
+         ms.shmem_barrier_all()
 -        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
 -        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
 -        self._build_fused_stage1(w1, w1_scale)
 +        self._build_fused_stage1(self._bound_w1, self._bound_w1_scale)
-@@ -98,0 +113,83 @@ class MegaMoEV2:
+         self._build_fused_stage2()
+         if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
+             self.preload_aot_bundles()
+ 
 +    def _require_open(self):
 +        if self._closed:
 +            raise RuntimeError("MegaMoEV2 is closed")
@@ -322,28 +519,62 @@ index 422260e..367714b 100644
 +            key = (tensor.data_ptr(), tensor.numel(), tensor.dtype)
 +            self._borrowed_weight_refs[key] = tensor
 +
-@@ -100,0 +198 @@ class MegaMoEV2:
+     def preload_aot_bundles(self):
+         """Load the paired Stage1 and Stage2 production bundles."""
 +        self._require_open()
-@@ -522,0 +621,2 @@ class MegaMoEV2:
+         self.preload_stage1_bundle()
+         self.preload_stage2_bundle()
+ 
+@@ -520,6 +618,8 @@ class MegaMoEV2:
+         wts,
+         scales,
+         topk_ids,
 +        w1=None,
 +        w1_scale=None,
-@@ -531,0 +632,4 @@ class MegaMoEV2:
+         stream=None,
+         config: Stage1Config | None = None,
+         *,
+@@ -529,6 +629,10 @@ class MegaMoEV2:
+             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
+         elif hasattr(stream, "cuda_stream"):
+             stream = fx.Stream(stream.cuda_stream)
 +        if w1 is None:
 +            w1 = self._bound_w1
 +        if w1_scale is None:
 +            w1_scale = self._bound_w1_scale
-@@ -571 +675 @@ class MegaMoEV2:
+         cur_tok = int(x.shape[0])
+         if cur_tok > self.mtpr:
+             raise ValueError(f"run_tokens={cur_tok} > max_tok_per_rank={self.mtpr}")
+@@ -568,7 +672,7 @@ class MegaMoEV2:
+             self._run_compact_prepare(topk_ids, cur_tok, config, stream)
+         op = self._s1_op
+         common_args = (
 -            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
 +            self._s1_out, self._s1_rx, w1.view(torch.uint8), self._s1_scale_i32, w1_scale.view(torch.uint8),
-@@ -643,0 +748,4 @@ class MegaMoEV2:
+             op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
+             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(cur_tok), fx.Int64(x.data_ptr()),
+             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()),
+@@ -641,6 +745,10 @@ class MegaMoEV2:
+         wts,
+         topk_ids,
+         run_tokens,
 +        w1,
 +        w1_scale,
 +        w2,
 +        w2_scale,
-@@ -656,0 +765,2 @@ class MegaMoEV2:
+         stream,
+         slice_output,
+         *,
+@@ -654,18 +762,50 @@ class MegaMoEV2:
+             wts,
+             scales,
+             topk_ids,
 +            w1,
 +            w1_scale,
-@@ -661 +771,8 @@ class MegaMoEV2:
+             stream=stream,
+             config=config.stage1,
+             prepared=prepared,
+         )
 -        return self._run_stage2(run_tokens, stream, slice_output, config)
 +        return self._run_stage2(
 +            run_tokens,
@@ -353,7 +584,7 @@ index 422260e..367714b 100644
 +            w2,
 +            w2_scale,
 +        )
-@@ -663 +780,13 @@ class MegaMoEV2:
+ 
 -    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
 +    def _run_stage2(
 +        self,
@@ -368,7 +599,8 @@ index 422260e..367714b 100644
 +            w2 = self._bound_w2
 +        if w2_scale is None:
 +            w2_scale = self._bound_w2_scale
-@@ -666 +795,6 @@ class MegaMoEV2:
+         if config.stage2.aligned_pair:
+             return self._run_aligned_pair_stage2(
 -                run_tokens, config, stream, slice_output
 +                run_tokens,
 +                config,
@@ -376,7 +608,7 @@ index 422260e..367714b 100644
 +                slice_output,
 +                w2,
 +                w2_scale,
-@@ -668 +802,7 @@ class MegaMoEV2:
+             )
 -        ret = self._run_fused_stage2(run_tokens, config, stream)
 +        ret = self._run_fused_stage2(
 +            run_tokens,
@@ -385,7 +617,13 @@ index 422260e..367714b 100644
 +            w2=w2,
 +            w2_scale=w2_scale,
 +        )
-@@ -684 +824,22 @@ class MegaMoEV2:
+         return self._stage2_output(ret, run_tokens, slice_output)
+ 
+     def _stage2_output(self, result, run_tokens, slice_output):
+@@ -681,23 +821,66 @@ class MegaMoEV2:
+             )
+         return out_tok[:run_tokens] if slice_output else out_tok
+ 
 -    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
 +    def _forward_with_weights(
 +        self,
@@ -409,23 +647,30 @@ index 422260e..367714b 100644
 +            w2_scale,
 +            require_layout_marker=require_layout_marker,
 +        )
-@@ -689,0 +851,4 @@ class MegaMoEV2:
+         run_tokens = int(x_bf16.shape[0])
+         if run_tokens > self.mtpr:
+             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
+         if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
+             raise ValueError("x_bf16 must be contiguous bfloat16")
 +        if tuple(x_bf16.shape) != (run_tokens, self.model_dim):
 +            raise ValueError(
 +                f"x_bf16 must have shape ({run_tokens}, {self.model_dim})"
 +            )
-@@ -691,0 +857,2 @@ class MegaMoEV2:
+         if wts.dtype != torch.float32 or not wts.is_contiguous():
+             raise ValueError("wts must be contiguous float32")
 +        if tuple(wts.shape) != (run_tokens, self.topk):
 +            raise ValueError(f"wts must have shape ({run_tokens}, {self.topk})")
-@@ -693,0 +861,5 @@ class MegaMoEV2:
+         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+             raise ValueError("topk_ids must be contiguous int32")
 +        if tuple(topk_ids.shape) != (run_tokens, self.topk):
 +            raise ValueError(
 +                f"topk_ids must have shape ({run_tokens}, {self.topk})"
 +            )
 +        config = self._select_config(run_tokens)
-@@ -695,0 +868 @@ class MegaMoEV2:
+         if self._s1_fixed_slot:
+             x_q, scales = self.quantize(x_bf16)
 +            self._retain_borrowed_weights((w1, w1_scale, w2, w2_scale))
-@@ -697 +870,12 @@ class MegaMoEV2:
+             return self._run_joint(
 -                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
 +                x_q,
 +                scales,
@@ -439,16 +684,33 @@ index 422260e..367714b 100644
 +                stream,
 +                slice_output,
 +                config=config,
-@@ -700 +883,0 @@ class MegaMoEV2:
+             )
+ 
 -        config = self._select_config(run_tokens)
-@@ -714,0 +898 @@ class MegaMoEV2:
+         prepare_stream = stream
+         if prepare_stream is None:
+             prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
+@@ -712,23 +895,141 @@ class MegaMoEV2:
+         )
+         x_q = self._s1_quant_x[:run_tokens]
+         scales = self._s1_quant_scale[:run_tokens]
 +        self._retain_borrowed_weights((w1, w1_scale, w2, w2_scale))
-@@ -720,0 +905,4 @@ class MegaMoEV2:
+         return self._run_joint(
+             x_q,
+             scales,
+             wts,
+             topk_ids,
+             run_tokens,
 +            w1,
 +            w1_scale,
 +            w2,
 +            w2_scale,
-@@ -726,0 +915,40 @@ class MegaMoEV2:
+             stream,
+             slice_output,
+             config=config,
+             prepared=True,
+         )
+ 
 +    def forward_with_weights(
 +        self,
 +        x_bf16,
@@ -489,9 +751,11 @@ index 422260e..367714b 100644
 +            slice_output=slice_output,
 +        )
 +
-@@ -727,0 +956 @@ class MegaMoEV2:
+     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
 +        self._require_open()
-@@ -731 +960,73 @@ class MegaMoEV2:
+         run_tokens = int(x_q.shape[0])
+         if run_tokens > self.mtpr:
+             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
 -        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
 +        return self._run_joint(
 +            x_q,
@@ -566,7 +830,13 @@ index 422260e..367714b 100644
 +
 +    def __exit__(self, *_):
 +        self.close()
-@@ -780 +1081,11 @@ class MegaMoEV2:
+ 
+     forward_bf16 = forward
+     __call__ = forward
+@@ -777,7 +1078,17 @@ class MegaMoEV2:
+             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
+         )
+ 
 -    def _fused_stage2_call(self, launcher, config, stream, *, runtime_pair_skip, scatter_vec):
 +    def _fused_stage2_call(
 +        self,
@@ -579,15 +849,30 @@ index 422260e..367714b 100644
 +        runtime_pair_skip,
 +        scatter_vec,
 +    ):
-@@ -788,2 +1099,2 @@ class MegaMoEV2:
+         """Invoke one normal Stage2 variant through its shared ABI."""
+         op = self._s1_op
+         workspace = self._s1_dispatch_workspace
+@@ -785,8 +1096,8 @@ class MegaMoEV2:
+         launcher(
+             fx.Int64(self._s1_out.view(-1).data_ptr()),
+             fx.Int64(self._s1_osd.data_ptr()),
 -            fx.Int64(self.w2.data_ptr()),
 -            fx.Int64(self.w2_scale.data_ptr()),
 +            fx.Int64(w2.data_ptr()),
 +            fx.Int64(w2_scale.data_ptr()),
-@@ -834,0 +1146,2 @@ class MegaMoEV2:
+             fx.Int64(op.sorted_expert_ids.data_ptr()),
+             fx.Int64(op.num_valid.data_ptr()),
+             fx.Int64(workspace["max_expert_tiles"].data_ptr()),
+@@ -832,11 +1143,20 @@ class MegaMoEV2:
+             self._g2_preload,
+             config,
+             stream,
 +            self._bound_w2,
 +            self._bound_w2_scale,
-@@ -839 +1152,8 @@ class MegaMoEV2:
+             runtime_pair_skip=runtime_pair_skip,
+             scatter_vec=scatter_vec,
+         )
+ 
 -    def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
 +    def _aligned_pair_stage2_call(
 +        self,
@@ -597,12 +882,24 @@ index 422260e..367714b 100644
 +        w2,
 +        w2_scale,
 +    ):
-@@ -848,2 +1168,2 @@ class MegaMoEV2:
+         """Invoke the aligned-pair Stage2 kernel through its shared ABI."""
+         stage2 = config.stage2
+         invariants = self._g2_invariants_by_quant[config.p2p_quant]
+@@ -845,8 +1165,8 @@ class MegaMoEV2:
+         launcher(
+             fx.Int64(self._s1_out.view(-1).data_ptr()),
+             fx.Int64(self._s1_osd.data_ptr()),
 -            fx.Int64(self.w2.data_ptr()),
 -            fx.Int64(self.w2_scale.data_ptr()),
 +            fx.Int64(w2.data_ptr()),
 +            fx.Int64(w2_scale.data_ptr()),
-@@ -882 +1202,7 @@ class MegaMoEV2:
+             fx.Int64(op.srcmap_em.data_ptr()),
+             fx.Int64(op.wts_em.data_ptr()),
+             fx.Int64(workspace["expert_tile_end"].data_ptr()),
+@@ -879,7 +1199,13 @@ class MegaMoEV2:
+         )
+ 
+     def _preload_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
 -        self._aligned_pair_stage2_call(self._g2_pair_preload, config, stream)
 +        self._aligned_pair_stage2_call(
 +            self._g2_pair_preload,
@@ -611,18 +908,36 @@ index 422260e..367714b 100644
 +            self._bound_w2,
 +            self._bound_w2_scale,
 +        )
-@@ -924,0 +1251,2 @@ class MegaMoEV2:
+ 
+     def preload_stage2_bundle(self):
+         """Load every production Stage2 variant without GPU dispatch."""
+@@ -922,7 +1248,13 @@ class MegaMoEV2:
+         runtime_pair_skip: bool = False,
+         combine: bool = True,
+         scatter_vec: int = 8,
 +        w2=None,
 +        w2_scale=None,
-@@ -925,0 +1254,4 @@ class MegaMoEV2:
+     ):
 +        if w2 is None:
 +            w2 = self._bound_w2
 +        if w2_scale is None:
 +            w2_scale = self._bound_w2_scale
-@@ -935,0 +1268,2 @@ class MegaMoEV2:
+         comb_op = self.comb_op
+         if stream is None:
+             stream = torch.cuda.current_stream()
+@@ -933,6 +1265,8 @@ class MegaMoEV2:
+             self._g2_run,
+             config,
+             s_fx,
 +            w2,
 +            w2_scale,
-@@ -947 +1281,7 @@ class MegaMoEV2:
+             runtime_pair_skip=bool(runtime_pair_skip),
+             scatter_vec=int(scatter_vec),
+         )
+@@ -944,7 +1278,13 @@ class MegaMoEV2:
+             stage2_p2p_quant=p2p_quant,
+         )
+ 
 -    def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
 +    def _launch_aligned_pair_stage2(
 +        self,
@@ -631,13 +946,31 @@ index 422260e..367714b 100644
 +        w2,
 +        w2_scale,
 +    ):
-@@ -954,0 +1295,2 @@ class MegaMoEV2:
+         """Launch the production common-pair kernel on ``stream``."""
+         if config.p2p_quant != "fp8_blockwise_1x32":
+             raise ValueError("aligned-pair Stage2 requires FP8 P2P output")
+@@ -952,6 +1292,8 @@ class MegaMoEV2:
+             self._g2_pair_run,
+             config,
+             fx.Stream(stream.cuda_stream),
 +            w2,
 +            w2_scale,
-@@ -962,0 +1305,2 @@ class MegaMoEV2:
+         )
+ 
+     def _run_aligned_pair_stage2(
+@@ -960,6 +1302,8 @@ class MegaMoEV2:
+         config: MegaMoEConfig,
+         stream,
+         slice_output: bool,
 +        w2,
 +        w2_scale,
-@@ -974 +1318,6 @@ class MegaMoEV2:
+     ):
+         """Overlap the common-pair kernel with the residual Stage2 kernel."""
+         main_stream = torch.cuda.current_stream() if stream is None else stream
+@@ -971,7 +1315,12 @@ class MegaMoEV2:
+ 
+         self._g2_residual_start.record(main_stream)
+         self._g2_residual_stream.wait_event(self._g2_residual_start)
 -        self._launch_aligned_pair_stage2(config, main_stream)
 +        self._launch_aligned_pair_stage2(
 +            config,
@@ -645,16 +978,66 @@ index 422260e..367714b 100644
 +            w2,
 +            w2_scale,
 +        )
-@@ -981,0 +1331,2 @@ class MegaMoEV2:
+         self._run_fused_stage2(
+             run_tokens,
+             residual_config,
+@@ -979,6 +1328,8 @@ class MegaMoEV2:
+             runtime_pair_skip=True,
+             combine=False,
+             scatter_vec=ALIGNED_PAIR_SCATTER_VEC,
 +            w2=w2,
 +            w2_scale=w2_scale,
+         )
+         self._g2_residual_done.record(self._g2_residual_stream)
+         main_stream.wait_event(self._g2_residual_done)
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/preload.py b/aiter/ops/flydsl/kernels/mega_moe/preload.py
+new file mode 100644
+index 0000000..2de080b
+--- /dev/null
++++ b/aiter/ops/flydsl/kernels/mega_moe/preload.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2025-2026 FlyDSL Project Contributors
++
++import os
++import threading
++
++import flydsl.compiler as flyc
++
++_PRELOAD_COMPILE_LOCK = threading.RLock()
++
++
++def preload_compiled(exe, *args):
++    preload = getattr(exe, "preload", None)
++    if callable(preload):
++        return preload(*args)
++
++    with _PRELOAD_COMPILE_LOCK:
++        old_compile_only = os.environ.get("COMPILE_ONLY")
++        os.environ["COMPILE_ONLY"] = "1"
++        try:
++            return flyc.compile(exe, *args)
++        finally:
++            if old_compile_only is None:
++                os.environ.pop("COMPILE_ONLY", None)
++            else:
++                os.environ["COMPILE_ONLY"] = old_compile_only
 diff --git a/op_tests/multigpu_tests/bench_mega_moe_v2.py b/op_tests/multigpu_tests/bench_mega_moe_v2.py
 index 25f72dd..e1815ff 100644
 --- a/op_tests/multigpu_tests/bench_mega_moe_v2.py
 +++ b/op_tests/multigpu_tests/bench_mega_moe_v2.py
-@@ -7,0 +8 @@ import argparse
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import argparse
 +import json
-@@ -88 +89,12 @@ def barrier():
+ import os
+ from dataclasses import replace
+ from pathlib import Path
+@@ -85,7 +86,18 @@ def barrier():
+     ms.shmem_barrier_all()
+ 
+ 
 -def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, device):
 +def make_inputs(
 +    tokens,
@@ -668,7 +1051,13 @@ index 25f72dd..e1815ff 100644
 +    device,
 +    route_ids=None,
 +):
-@@ -100 +112,10 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias,
+     local_experts = experts // world
+     generator = torch.Generator(device=device).manual_seed(1234 + rank)
+     x = torch.randn(
+@@ -97,7 +109,16 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias,
+     if route == "hot-rank0":
+         scores[:, :local_experts] += hot_bias
+     values, ids = torch.topk(scores, topk, dim=-1)
 -    if route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
 +    if route_ids is not None:
 +        if route_ids.ndim != 2 or tuple(route_ids.shape) != (tokens, topk):
@@ -680,18 +1069,36 @@ index 25f72dd..e1815ff 100644
 +            raise ValueError("captured routes contain an out-of-range expert ID")
 +        ids = route_ids.to(device=device, dtype=torch.int64)
 +    elif route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
-@@ -259,0 +281,5 @@ def main():
+         destination_scores = torch.rand(
+             (tokens, world), device=device, generator=generator
+         )
+@@ -257,6 +278,11 @@ def main():
+     parser.add_argument("--profile-dir", default="")
+     parser.add_argument("--mega-only", action="store_true")
+     parser.add_argument("--perf-guard", action="store_true")
 +    parser.add_argument(
 +        "--route-ids-json",
 +        type=Path,
 +        help="AgentX capture JSON containing a topk_ids matrix.",
 +    )
-@@ -277,2 +303,2 @@ def main():
+     args = parser.parse_args()
+ 
+     if not args.mega_only and args.phase is None:
+@@ -274,8 +300,8 @@ def main():
+     os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+ 
+     rank, world, device = setup_dist()
 -    if world != 8:
 -        raise ValueError("This comparison requires eight ranks")
 +    if world not in (2, 4, 8):
 +        raise ValueError("This comparison requires 2, 4, or 8 ranks")
-@@ -285,0 +312,10 @@ def main():
+     if args.experts % world:
+         raise ValueError(f"experts={args.experts} must be divisible by world={world}")
+     rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
+@@ -283,6 +309,16 @@ def main():
+         raise ValueError(f"--rank-tokens requires {world} comma-separated values")
+     tokens = rank_tokens[rank] if rank_tokens else args.tokens
+     max_rank_tokens = max(rank_tokens) if rank_tokens else args.tokens
 +    route_ids = None
 +    if args.route_ids_json is not None:
 +        payload = json.loads(args.route_ids_json.read_text())
@@ -702,9 +1109,21 @@ index 25f72dd..e1815ff 100644
 +        route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
 +        if route_ids.shape[0] < max_rank_tokens:
 +            raise ValueError("captured route rows do not cover the requested tokens")
-@@ -317,0 +354 @@ def main():
+     if max_rank_tokens > args.mtpr:
+         raise ValueError(
+             f"maximum input tokens ({max_rank_tokens}) exceed mtpr={args.mtpr}"
+@@ -315,6 +351,7 @@ def main():
+         args.route,
+         args.hot_bias,
+         device,
 +        None if route_ids is None else route_ids[:tokens],
-@@ -599,0 +637,7 @@ def main():
+     )
+     route_counts = torch.zeros(world, dtype=torch.int64, device=device)
+     route_counts.scatter_add_(
+@@ -597,6 +634,13 @@ def main():
+                 f"[PERF-GUARD] {status} speedup={speedup:.2f}% minimum={guard_floor:.2f}%",
+                 flush=True,
+             )
 +    mori_graph = None
 +    mega_graph = None
 +    stage1_graph = None
@@ -712,15 +1131,27 @@ index 25f72dd..e1815ff 100644
 +    torch.cuda.synchronize()
 +    barrier()
 +    mega.close()
+     ms.shmem_finalize()
+     dist.destroy_process_group()
+     if not guard_pass:
 diff --git a/op_tests/multigpu_tests/test_comm_fused_moe.py b/op_tests/multigpu_tests/test_comm_fused_moe.py
 index 946e575..c28b743 100644
 --- a/op_tests/multigpu_tests/test_comm_fused_moe.py
 +++ b/op_tests/multigpu_tests/test_comm_fused_moe.py
-@@ -106 +106,2 @@ class Stage2Case:
+@@ -103,7 +103,8 @@ class Stage2Weights:
+ class Stage2Case:
+     tokens: int
+     block_m: int
 -    inter_states: torch.Tensor
 +    ordinary_inter_states: torch.Tensor
 +    comm_fused_inter_states: torch.Tensor
-@@ -240,0 +242,28 @@ def _make_routes(tokens: int, route: str, device):
+     a2_scale: torch.Tensor
+     reference_a2_scale: torch.Tensor
+     topk_ids: torch.Tensor
+@@ -238,6 +239,34 @@ def _make_routes(tokens: int, route: str, device):
+     )
+ 
+ 
 +def _token_major_to_sorted_routes(
 +    values: torch.Tensor,
 +    sorted_ids: torch.Tensor,
@@ -749,12 +1180,27 @@ index 946e575..c28b743 100644
 +    return out
 +
 +
-@@ -310,0 +340 @@ def _make_stage2_case(
+ def _make_stage2_weights(rank: int, device) -> Stage2Weights:
+     """Create one deterministic W2 shared by every token/route case."""
+ 
+@@ -308,6 +337,7 @@ def _make_stage2_case(
+     route: str,
+     block_m: int,
+     requires_output_zero: bool,
 +    ordinary_requires_sorted_input: bool,
-@@ -354 +384 @@ def _make_stage2_case(
+     rank: int,
+     device,
+ ) -> Stage2Case:
+@@ -351,11 +381,24 @@ def _make_stage2_case(
+         device=device,
+         generator=generator,
+     ).mul_(INTER_DIM**-0.25)
 -    inter_states, reference_a2_scale = per_1x32_f8_scale_f8_quant(
 +    comm_fused_inter_states, reference_a2_scale = per_1x32_f8_scale_f8_quant(
-@@ -358,0 +389,13 @@ def _make_stage2_case(
+         activations,
+         quant_dtype=dtypes.fp8,
+         scale_type=dtypes.fp8_e8m0,
+     )
 +    comm_fused_inter_states = comm_fused_inter_states.view(
 +        tokens, TOPK, INTER_DIM
 +    )
@@ -768,35 +1214,84 @@ index 946e575..c28b743 100644
 +        if ordinary_requires_sorted_input
 +        else comm_fused_inter_states
 +    )
-@@ -374 +417,2 @@ def _make_stage2_case(
+     a2_scale = mxfp4_moe_sort_fwd(
+         reference_a2_scale.view(tokens * TOPK, -1),
+         sorted_ids=sorted_ids,
+@@ -371,7 +414,8 @@ def _make_stage2_case(
+     return Stage2Case(
+         tokens=tokens,
+         block_m=block_m,
 -        inter_states=inter_states.view(tokens, TOPK, INTER_DIM),
 +        ordinary_inter_states=ordinary_inter_states,
 +        comm_fused_inter_states=comm_fused_inter_states,
-@@ -436 +480 @@ def _torch_stage2_allreduce(
+         a2_scale=a2_scale,
+         reference_a2_scale=reference_a2_scale,
+         topk_ids=topk_ids,
+@@ -433,7 +477,7 @@ def _torch_stage2_allreduce(
+     group,
+ ) -> torch.Tensor:
+     output = _torch_stage2_partial(
 -        case.inter_states,
 +        case.comm_fused_inter_states,
-@@ -454 +498 @@ def _run_ordinary_stage2(
+         case.reference_a2_scale,
+         case.topk_ids,
+         case.topk_weights,
+@@ -451,7 +495,7 @@ def _run_ordinary_stage2(
+     if fixture.requires_output_zero:
+         case.partial_out.zero_()
+     fixture.metadata.stage2(
 -        case.inter_states,
 +        case.ordinary_inter_states,
-@@ -481,0 +526 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
+         None,
+         weights.kernel,
+         case.sorted_token_ids,
+@@ -479,6 +523,7 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
+         route,
+         int(metadata.block_m),
+         requires_zero,
 +        "_moe2_layout_" in kernel_name,
-@@ -817 +862 @@ def _run_stage2_case(
+         session.rank,
+         session.device,
+     )
+@@ -814,7 +859,7 @@ def _run_stage2_case(
+         prepared = runner.prepare_shared_partial(fixture.shared_partial)
+         return runner(
+             stage2_args=(
 -                case.inter_states,
 +                case.comm_fused_inter_states,
-@@ -1068,0 +1114 @@ def main() -> None:
+                 None,
+                 session.weights.kernel,
+                 case.sorted_token_ids,
+@@ -1066,7 +1111,10 @@ def main() -> None:
+                 flush=True,
+             )
+     finally:
 +        session = _ACTIVE_SESSION
-@@ -1069,0 +1116,2 @@ def main() -> None:
+         _ACTIVE_SESSION = None
 +        if session is not None:
 +            session.runners.close()
+         if previous_fp8_bound is None:
+             os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+         else:
 diff --git a/op_tests/multigpu_tests/test_mega_moe_v2.py b/op_tests/multigpu_tests/test_mega_moe_v2.py
 index ae5f820..88a6007 100644
 --- a/op_tests/multigpu_tests/test_mega_moe_v2.py
 +++ b/op_tests/multigpu_tests/test_mega_moe_v2.py
-@@ -7,0 +8 @@ import argparse
+@@ -5,8 +5,10 @@
+ from __future__ import annotations
+ 
+ import argparse
 +import json
-@@ -9,0 +11 @@ from dataclasses import replace
+ import os
+ from dataclasses import replace
 +from pathlib import Path
-@@ -39,0 +42,14 @@ NETWORKS = {
+ 
+ os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
+ 
+@@ -37,6 +39,20 @@ NETWORKS = {
+         "topk": 6,
+         "swiglu_limit": 10.0,
+     },
 +    "dsv41": {
 +        "model_dim": 5120,
 +        "inter_dim": 2304,
@@ -811,9 +1306,21 @@ index ae5f820..88a6007 100644
 +        "topk": 3,
 +        "swiglu_limit": 10.0,
 +    },
-@@ -102,0 +119 @@ def _make_inputs(
+     # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
+     # the numerical reference intentionally keeps MegaMoEV2's current bounded
+     # SwiGLU activation while the K3 activation integration remains separate.
+@@ -100,6 +116,7 @@ def _make_inputs(
+     force_fanout_boundary,
+     inject_invalid_route,
+     force_padding_boundary,
 +    route_ids,
-@@ -112 +129,14 @@ def _make_inputs(
+ ):
+     generator = torch.Generator(device=device).manual_seed(seed + rank)
+     x = torch.randn(
+@@ -109,7 +126,20 @@ def _make_inputs(
+         (tokens, experts), dtype=torch.float32, device=device, generator=generator
+     )
+     values, ids = torch.topk(scores, topk, dim=-1)
 -    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
 +    if route_ids is not None:
 +        if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
@@ -829,19 +1336,44 @@ index ae5f820..88a6007 100644
 +            raise ValueError("captured routes contain an out-of-range expert ID")
 +        ids = route_ids.to(device=device, dtype=torch.int64)
 +    elif force_fanout_boundary or inject_invalid_route or force_padding_boundary:
-@@ -166,0 +197 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
+         if topk != 16 or experts % dist.get_world_size():
+             raise ValueError("fanout adversarial cases require topk=16 and EP")
+         world = dist.get_world_size()
+@@ -164,6 +194,7 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
+     w1_scale_ref = w1_scale.view(local_experts, 2 * inter_dim, model_dim // 32)
+     del w1
+     w1_kernel = shuffle_weight_a16w4(w1_q, 16, True).contiguous()
 +    w1_kernel.is_shuffled = True
-@@ -180,0 +212 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
+     w1_scale_kernel = shuffle_scale_a16w4(w1_scale, local_experts, True).contiguous()
+ 
+     w2 = torch.randn(
+@@ -178,6 +209,7 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
+     w2_scale_ref = w2_scale.view(local_experts, model_dim, inter_dim // 32)
+     del w2
+     w2_kernel = shuffle_weight_a16w4(w2_q, 16, False).contiguous()
 +    w2_kernel.is_shuffled = True
-@@ -454,0 +487,5 @@ def main():
+     w2_scale_kernel = shuffle_scale_a16w4(w2_scale, local_experts, False).contiguous()
+     torch.cuda.empty_cache()
+     return (
+@@ -452,6 +484,11 @@ def main():
+     parser.add_argument("--force-fanout-boundary", action="store_true")
+     parser.add_argument("--inject-invalid-route", action="store_true")
+     parser.add_argument("--force-padding-boundary", action="store_true")
 +    parser.add_argument(
 +        "--route-ids-json",
 +        type=Path,
 +        help="AgentX capture JSON containing a topk_ids matrix.",
 +    )
-@@ -472,0 +510 @@ def main():
+     args = parser.parse_args()
+     if (
+         sum(
+@@ -470,8 +507,22 @@ def main():
+     rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
+ 
+     rank, world, device = _setup_dist()
 +    shared_moe = None
-@@ -474,0 +513,13 @@ def main():
+     try:
+         network = NETWORKS[args.network]
 +        route_ids = None
 +        if args.route_ids_json is not None:
 +            payload = json.loads(args.route_ids_json.read_text())
@@ -855,20 +1387,46 @@ index ae5f820..88a6007 100644
 +            if int(payload.get("topk", network["topk"])) != network["topk"]:
 +                raise ValueError("captured route top-k does not match the network")
 +            route_ids = torch.tensor(payload["topk_ids"], dtype=torch.int32)
-@@ -515,0 +567 @@ def main():
+         if network["experts"] % world:
+             raise ValueError(
+                 f"experts={network['experts']} must be divisible by world={world}"
+@@ -513,6 +564,7 @@ def main():
+             force_fanout_boundary=args.force_fanout_boundary,
+             inject_invalid_route=args.inject_invalid_route,
+             force_padding_boundary=args.force_padding_boundary,
 +            route_ids=route_ids,
-@@ -525 +576,0 @@ def main():
+         )
+         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+         # MegaMoE's producer/consumer wire geometry is rank-invariant. A
+@@ -522,13 +574,14 @@ def main():
+         if rank_tokens and not config_tokens:
+             config_tokens = max(1, max(rank_tokens))
+ 
 -        shared_moe = None
-@@ -531,0 +583,2 @@ def main():
+         for batch_size in batch_sizes:
+             local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
+             max_tok_per_rank = args.max_tok_per_rank or max(
+                 16, _next_power_of_two(batch_size)
+             )
+             if shared_moe is None or args.max_tok_per_rank is None:
 +                if shared_moe is not None:
 +                    shared_moe.close()
-@@ -593 +646,5 @@ def main():
+                 fanout_masks = ()
+                 if args.force_fanout_boundary:
+                     pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
+@@ -590,7 +643,11 @@ def main():
+                     device,
+                 )
+     finally:
 -        _cleanup()
 +        try:
 +            if shared_moe is not None:
 +                shared_moe.close()
 +        finally:
 +            _cleanup()
+ 
+ 
+ if __name__ == "__main__":
 diff --git a/op_tests/multigpu_tests/test_mega_moe_v2_workspace.py b/op_tests/multigpu_tests/test_mega_moe_v2_workspace.py
 new file mode 100644
 index 0000000..9d04271
@@ -1251,7 +1809,10 @@ diff --git a/op_tests/tuners/tune_comm_fused_moe.py b/op_tests/tuners/tune_comm_
 index ad75a04..cbe5ccb 100644
 --- a/op_tests/tuners/tune_comm_fused_moe.py
 +++ b/op_tests/tuners/tune_comm_fused_moe.py
-@@ -389,14 +389,15 @@ def benchmark(
+@@ -386,58 +386,61 @@ def benchmark(
+     """Measure one complete Stage2 + shared + TP communication candidate."""
+ 
+     runner = create_runner(tp_group, config)
 -    runner.output.fill_(float("nan"))
 -    candidate_shared = shared_partial.clone()
 -    prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
@@ -1281,7 +1842,7 @@ index ad75a04..cbe5ccb 100644
 +                shared_partial=current_shared,
 +                ordinary_stage2=ordinary_stage2,
 +            )
-@@ -404,7 +405,8 @@ def benchmark(
+ 
 -    reference_f32 = reference.float()
 -    output = run()
 -    diff = output.float() - reference_f32
@@ -1297,7 +1858,7 @@ index ad75a04..cbe5ccb 100644
 +                diff.abs().max(),
 +                diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
 +            )
-@@ -412,17 +414,10 @@ def benchmark(
+         )
 -    )
 -    dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
 -
@@ -1325,7 +1886,7 @@ index ad75a04..cbe5ccb 100644
 +            warmup_replays=warmup_replays,
 +            rounds=rounds,
 +            iterations=iterations,
-@@ -430,11 +425,19 @@ def benchmark(
+         )
 -    )
 -    dist.all_reduce(graph_error, op=dist.ReduceOp.MAX, group=process_group)
 -    error = torch.maximum(error, graph_error)
@@ -1356,9 +1917,18 @@ index ad75a04..cbe5ccb 100644
 +        )
 +    finally:
 +        runner.close()
-@@ -699 +702,4 @@ def main():
+ 
+ 
+ _CONFIG_TYPES = {
+@@ -696,7 +699,10 @@ def main():
+         )
+         from aiter.ops.flydsl.comm_fused_moe_host import winners_for
+ 
 -        current = winners_for(shape).get(args.token)
 +        try:
 +            current = winners_for(shape).get(args.token)
 +        except KeyError:
 +            current = None
+         if current is None and args.family == "current":
+             raise KeyError(
+                 f"no production comm_fused config for M={args.token}; "

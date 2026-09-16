@@ -53,6 +53,23 @@ case "${VLLM_MOE_SHAPE_CAPTURE:-0}" in
             "$VLLM_MOE_SHAPE_CAPTURE_ACTIVE_FILE"
         ;;
 esac
+aiter_mega_moe_v2=0
+force_mori_all2all=0
+case "${VLLM_AITER_MEGA_MOE_V2:-0}" in
+    1|true|TRUE|yes|YES)
+        aiter_mega_moe_v2=1
+        force_mori_all2all=1
+        export AITER_MEGA_MOE_PRELOAD=1
+        ;;
+esac
+case "${VLLM_FORCE_MORI_ALL2ALL:-0}" in
+    1|true|TRUE|yes|YES)
+        force_mori_all2all=1
+        ;;
+esac
+if (( force_mori_all2all )); then
+    export MORI_SHMEM_HEAP_SIZE="${MORI_SHMEM_HEAP_SIZE:-40G}"
+fi
 # Pin the full-context corpus for this 1M-context recipe.
 export WEKA_LOADER_OVERRIDE=semianalysis_cc_traces_weka_062126
 resolve_trace_source
@@ -73,6 +90,9 @@ CAPTURE_SIZE=1
 while (( CAPTURE_SIZE < MAX_NUM_SEQS * (1 + NUM_SPEC_TOKENS) && CAPTURE_SIZE < 2048 )); do
     CAPTURE_SIZE=$((CAPTURE_SIZE * 2))
 done
+if (( force_mori_all2all )); then
+    CAPTURE_SIZE="${VLLM_MEGAMOE_CUDAGRAPH_CAPTURE_SIZE:-128}"
+fi
 
 # Use the runner-specific port assigned by launch_mi355x-amds.sh.
 export AIPERF_SERVER_URL="http://localhost:${PORT}"
@@ -105,7 +125,7 @@ VLLM_CMD=(
     # DSV4-Pro MI355X recipe already gets. Pinning the Triton name instead
     # forced the W4A16 _moe_gemm_a16w4 kernel.
     --moe-backend aiter
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
     --speculative-config "$SPEC_CONFIG"
     --max-model-len 1048576
     --max-num-seqs "$MAX_NUM_SEQS"
@@ -113,6 +133,17 @@ VLLM_CMD=(
     --max-num-batched-tokens 16384
     --disable-uvicorn-access-log
 )
+if (( force_mori_all2all )); then
+    VLLM_CMD+=(--enable-expert-parallel --all2all-backend mori_high_throughput)
+    if (( aiter_mega_moe_v2 )); then
+        VLLM_CMD+=(
+            --kernel-config
+            '{"enable_aiter_mega_moe_v2":true,"aiter_mega_moe_v2_max_tokens":8192,"aiter_mega_moe_v2_token_allowlist":[888,889,2625,2626,7100,7101]}'
+        )
+    else
+        VLLM_CMD+=(--kernel-config '{"force_mori_all2all":true}')
+    fi
+fi
 if (( shape_capture )); then
     # Diagnostic only: Python must observe every real routing invocation.
     VLLM_CMD+=(--enforce-eager)
