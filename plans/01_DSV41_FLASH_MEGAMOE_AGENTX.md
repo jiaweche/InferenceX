@@ -53,6 +53,8 @@ normalized interactivity by 3.20%. Plan 06's three 1200-second pairs retained a
 canonical confirmation and KEEP were stopped. TraceLens found no Mega kernels
 in the regressing tail window: mixed batches used ordinary Mori+AITER but paid
 an extra GPU padding sync and two Gloo selector collectives per model iteration.
+[Plan 07](./07_DSV41_FLASH_MEGAMOE_SELECTOR_REMEDIATION.md) is executing a
+metadata-first selector and one-collective rank agreement before re-confirming.
 
 ## 2. Branch and source baseline
 
