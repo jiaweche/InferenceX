@@ -51,6 +51,28 @@ concurrency widening were not started. The candidate is not approved for KEEP.
 Durable evidence is under
 `/home/jiaweche/dsv41-megamoe-validation-20260915/mtpr16384/confirmation/`.
 
+### ITL tail profile
+
+Matched stack-and-shape Chrome traces were analyzed with AMD TraceLens
+`36a35e40d934457833646ae903bda79089451d34`.
+
+The captured tail window contained mixed and unlisted batches only. Candidate
+Mega kernel count was zero; both arms ran ordinary Mori+AITER. Normalized total
+GPU time differed by only +0.044%, ruling out a direct Mega or decode-graph
+kernel regression.
+
+The candidate-only gap is selector synchronization on guaranteed fallback
+batches:
+
+- eight GPU `aten::any` padding checks in eight captured model iterations;
+- sixteen Gloo all-reduces, totaling 4.635 ms;
+- 0.579 ms rank-agreement time per mixed model iteration.
+
+TraceLens links the `aten::any` call to the selective adapter's local selector.
+The next candidate should evaluate CPU phase/M metadata before touching the
+padding tensor and replace two min/max reductions with one gathered agreement.
+This must be implemented and re-confirmed before revisiting canonical KEEP.
+
 ## 1. Objective
 
 Determine whether the MTPR=16384 selective MegaMoEV2 adapter produces a

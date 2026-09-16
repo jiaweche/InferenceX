@@ -50,7 +50,9 @@ validated a 16384-token pool at +43% operator speed and raised observed
 non-capture coverage to 91.93%. Its two-request matched smoke improved P90
 normalized interactivity by 3.20%. Plan 06's three 1200-second pairs retained a
 +2.63% median P90 normalized-interactivity gain, but ITL P99 regressed 2.21%;
-canonical confirmation and KEEP were stopped.
+canonical confirmation and KEEP were stopped. TraceLens found no Mega kernels
+in the regressing tail window: mixed batches used ordinary Mori+AITER but paid
+an extra GPU padding sync and two Gloo selector collectives per model iteration.
 
 ## 2. Branch and source baseline
 
