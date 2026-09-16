@@ -1,9 +1,9 @@
 diff --git a/tests/model_executor/layers/test_aiter_mega_moe_v2.py b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
 new file mode 100644
-index 0000000..b1fd582
+index 0000000..11561cd
 --- /dev/null
 +++ b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,709 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -146,6 +146,45 @@ index 0000000..b1fd582
 +
 +    assert decision.eligible is expected
 +    assert decision.reason == reason
++
++
++class _UnreadablePadding:
++    def any(self):
++        pytest.fail("fallback selector read the GPU padding tensor")
++
++
++@pytest.mark.parametrize(
++    ("metadata", "raw_m", "reason"),
++    [
++        (_metadata(num_decodes=1, num_decode_tokens=6), 894, "mixed"),
++        (
++            _metadata(
++                num_decodes=1,
++                num_prefills=0,
++                num_decode_tokens=6,
++                num_prefill_tokens=0,
++            ),
++            6,
++            "decode",
++        ),
++        (_metadata(num_prefill_tokens=16379), 16379, "unlisted_m"),
++    ],
++)
++def test_guaranteed_fallback_does_not_read_padding(
++    metadata: DeepseekSparseSWAMetadata,
++    raw_m: int,
++    reason: str,
++) -> None:
++    context = _context(metadata)
++    context.is_padding = _UnreadablePadding()  # type: ignore[assignment]
++
++    decision = select_aiter_mega_moe_v2_local(
++        context,
++        raw_m,
++        _TOKEN_ALLOWLIST,
++    )
++
++    assert decision == AiterMegaMoEV2Decision(False, reason, raw_m)
 +
 +
 +def test_local_selector_rejects_metadata_disagreement() -> None:
@@ -328,6 +367,75 @@ index 0000000..b1fd582
 +    def agree_aiter_mega_moe_v2_selection(self, eligible, raw_m):
 +        self.calls += 1
 +        return eligible and self.agreed, self.agreed
++
++
++def _manager_for_selection_agreement() -> MoriAll2AllManager:
++    manager = object.__new__(MoriAll2AllManager)
++    manager.world_size = 4
++    manager.cpu_group = object()
++    manager._aiter_mega_moe_v2_lock = threading.RLock()
++    manager._aiter_mega_moe_v2_selection_local = torch.empty(
++        2,
++        dtype=torch.int64,
++    )
++    manager._aiter_mega_moe_v2_selection_gathered = torch.empty(
++        manager.world_size * 2,
++        dtype=torch.int64,
++    )
++    return manager
++
++
++@pytest.mark.parametrize("eligible", [False, True])
++def test_mori_manager_uses_one_strict_selection_gather(
++    monkeypatch,
++    eligible: bool,
++) -> None:
++    manager = _manager_for_selection_agreement()
++    calls = []
++
++    def all_gather_into_tensor(output, local, *, group):
++        calls.append((output, local, group))
++        output.copy_(local.repeat(manager.world_size))
++
++    monkeypatch.setattr(
++        "vllm.distributed.device_communicators.all2all.dist.all_gather_into_tensor",
++        all_gather_into_tensor,
++    )
++
++    selected, agreed = manager.agree_aiter_mega_moe_v2_selection(eligible, 16380)
++
++    assert selected is eligible
++    assert agreed
++    assert calls == [
++        (
++            manager._aiter_mega_moe_v2_selection_gathered,
++            manager._aiter_mega_moe_v2_selection_local,
++            manager.cpu_group,
++        )
++    ]
++
++
++@pytest.mark.parametrize("disagreement_column", [0, 1])
++def test_mori_manager_selection_gather_fails_closed(
++    monkeypatch,
++    disagreement_column: int,
++) -> None:
++    manager = _manager_for_selection_agreement()
++
++    def all_gather_into_tensor(output, local, *, group):
++        del group
++        output.copy_(local.repeat(manager.world_size))
++        output.view(manager.world_size, 2)[-1, disagreement_column] += 1
++
++    monkeypatch.setattr(
++        "vllm.distributed.device_communicators.all2all.dist.all_gather_into_tensor",
++        all_gather_into_tensor,
++    )
++
++    selected, agreed = manager.agree_aiter_mega_moe_v2_selection(True, 16380)
++
++    assert not selected
++    assert not agreed
 +
 +
 +def test_adapter_caches_one_rank_agreement(monkeypatch) -> None:
@@ -710,7 +818,7 @@ index a6dddc3..7083781 100644
      @classmethod
      def _normalize_linear_backend(cls, value: Any) -> Any:
 diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
-index eb187a9..ebbef44 100644
+index eb187a9..59aba54 100644
 --- a/vllm/distributed/device_communicators/all2all.py
 +++ b/vllm/distributed/device_communicators/all2all.py
 @@ -6,6 +6,7 @@ from typing import Any
@@ -721,7 +829,7 @@ index eb187a9..ebbef44 100644
  
  import vllm.envs as envs
  from vllm.config import get_current_vllm_config
-@@ -915,9 +916,137 @@ class MoriAll2AllManager(All2AllManagerBase):
+@@ -915,9 +916,151 @@ class MoriAll2AllManager(All2AllManagerBase):
          super().__init__(cpu_group)
          self._all2all_backend = all2all_backend
          self.handle_cache = Cache()
@@ -730,6 +838,16 @@ index eb187a9..ebbef44 100644
 +        self._aiter_mega_moe_v2_lock = threading.RLock()
 +        self._aiter_mega_moe_v2_counters: dict[tuple[str, str, int], int] = {}
 +        self._aiter_mega_moe_v2_preflight = []
++        self._aiter_mega_moe_v2_selection_local = torch.empty(
++            2,
++            dtype=torch.int64,
++            device="cpu",
++        )
++        self._aiter_mega_moe_v2_selection_gathered = torch.empty(
++            self.world_size * 2,
++            dtype=torch.int64,
++            device="cpu",
++        )
  
          torch._C._distributed_c10d._register_process_group("mori", cpu_group)
          mori.shmem.shmem_torch_process_group_init("mori")
@@ -809,17 +927,21 @@ index eb187a9..ebbef44 100644
 +    def agree_aiter_mega_moe_v2_selection(
 +        self, eligible: bool, raw_m: int
 +    ) -> tuple[bool, bool]:
-+        local = torch.tensor(
-+            (int(eligible), raw_m),
-+            dtype=torch.int64,
-+            device="cpu",
-+        )
-+        minimum = local.clone()
-+        maximum = local.clone()
-+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=self.cpu_group)
-+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=self.cpu_group)
-+        agreed = bool(torch.equal(minimum, maximum))
-+        return agreed and bool(minimum[0].item()), agreed
++        with self._aiter_mega_moe_v2_lock:
++            local = self._aiter_mega_moe_v2_selection_local
++            gathered = self._aiter_mega_moe_v2_selection_gathered
++            local[0] = int(eligible)
++            local[1] = raw_m
++            dist.all_gather_into_tensor(
++                gathered,
++                local,
++                group=self.cpu_group,
++            )
++            agreed = torch.equal(
++                gathered.view(self.world_size, 2),
++                local.expand(self.world_size, 2),
++            )
++            return agreed and bool(local[0].item()), agreed
 +
 +    def record_aiter_mega_moe_v2(self, path: str, reason: str, raw_m: int) -> None:
 +        key = (path, reason, raw_m)
@@ -902,7 +1024,7 @@ index b24ff64..4f58d80 100644
                  group_ranks,
 diff --git a/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py b/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py
 new file mode 100644
-index 0000000..b4323d6
+index 0000000..388ee03
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py
 @@ -0,0 +1,338 @@
@@ -967,8 +1089,6 @@ index 0000000..b4323d6
 +        return AiterMegaMoEV2Decision(False, "cudagraph", raw_m)
 +    if context.ubatch_slices is not None:
 +        return AiterMegaMoEV2Decision(False, "dbo", raw_m)
-+    if context.is_padding is not None and bool(context.is_padding.any().item()):
-+        return AiterMegaMoEV2Decision(False, "padding", raw_m)
 +
 +    metadata_values = _metadata_values(context)
 +    if not metadata_values:
@@ -995,6 +1115,8 @@ index 0000000..b4323d6
 +        return AiterMegaMoEV2Decision(False, "not_pure_prefill", raw_m)
 +    if raw_m not in token_allowlist:
 +        return AiterMegaMoEV2Decision(False, "unlisted_m", raw_m)
++    if context.is_padding is not None and bool(context.is_padding.any().item()):
++        return AiterMegaMoEV2Decision(False, "padding", raw_m)
 +    return AiterMegaMoEV2Decision(True, "eligible", raw_m)
 +
 +

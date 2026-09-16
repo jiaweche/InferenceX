@@ -16,6 +16,8 @@ Implementation and trace gates pass.
   and unlisted batches;
 - strict agreement uses one preallocated Gloo gather instead of two reductions;
 - focused source and image suites: 33/33 pass;
+- remediated vLLM source:
+  `132d417f020c37d02a101bf06b410d4db1a27ae3`;
 - immutable image:
   `dsv41-megamoe-adapter:vllm-e2944d9-aiter-22c8295-selector-r2`;
 - image ID:
