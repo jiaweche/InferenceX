@@ -56,6 +56,8 @@ an extra GPU padding sync and two Gloo selector collectives per model iteration.
 [Plan 07](./07_DSV41_FLASH_MEGAMOE_SELECTOR_REMEDIATION.md) removed the
 selector sync and passed fast-pair and accuracy gates. Canonical ITL P99 became
 neutral, but ITL P90 regressed 1.03%, so widening and KEEP remain stopped.
+Matched profiling attributes the residual to synchronous selector agreement
+shifting mixed-batch Mori combine timing, not to decode or expert kernels.
 
 ## 2. Branch and source baseline
 

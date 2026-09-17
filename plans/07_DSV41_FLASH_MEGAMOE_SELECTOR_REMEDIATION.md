@@ -80,6 +80,31 @@ profiled requests and approximately 1,226 seconds of active workload as each
 fast arm. The remaining wall time added no samples, so a future long
 confirmation must explicitly repeat the corpus.
 
+### Canonical ITL P90 follow-up profile
+
+A matched two-iteration Chrome/TraceLens profile used the same image and exact
+tail workload in both arms. It captured one pure-unlisted and one mixed
+fallback iteration; neither arm executed Mega.
+
+The residual regression is candidate-only fallback selector overhead:
+
+- steady Gloo agreement: 0.318 ms kernel-side / 0.672 ms inclusive Python;
+- cached adapter bookkeeping: approximately 0.424 ms per 40 layers;
+- first mixed Mori dispatch: 0.378 ms later than control;
+- mixed-context wall time: +12.46 ms, or +1.20%;
+- exact M=16,372 Mori combine: +617 us/layer, or +10.50%;
+- ordinary expert stage 1+2 kernels: 7.43% faster.
+
+The expert and decode kernels are not regressing. The synchronous agreement
+changes the launch phase of the ordinary mixed Mori pipeline, and slower
+combine timing overwhelms faster expert GEMMs.
+
+The next safe implementation should compute agreement once when
+`ForwardContext` is built, overlap it with attention, and wait only before an
+eligible Mega execution. Guaranteed fallback should avoid per-layer runtime
+contract checks and accounting. Do not conditionally skip the collective at
+the first MoE layer because rank divergence could deadlock.
+
 ## 1. Objective
 
 Remove candidate-only synchronization from mixed and unlisted eager fallback
