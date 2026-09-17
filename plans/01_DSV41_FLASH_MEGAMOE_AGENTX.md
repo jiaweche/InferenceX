@@ -58,6 +58,10 @@ selector sync and passed fast-pair and accuracy gates. Canonical ITL P99 became
 neutral, but ITL P90 regressed 1.03%, so widening and KEEP remain stopped.
 Matched profiling attributes the residual to synchronous selector agreement
 shifting mixed-batch Mori combine timing, not to decode or expert kernels.
+[Plan 08](./08_DSV41_FLASH_MEGAMOE_ASYNC_SELECTION.md) moved strict agreement
+to `ForwardContext`, removed the mixed-path regression, and passed three-pair
+median plus full accuracy gates. Final canonical KEEP awaits a runner that
+actually repeats the finite AgentX corpus.
 
 ## 2. Branch and source baseline
 

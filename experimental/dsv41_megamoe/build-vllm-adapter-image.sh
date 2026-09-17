@@ -5,9 +5,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vllm_src="${VLLM_SRC:-/scratch/$USER/dsv41-megamoe/vllm-src}"
 aiter_src="${AITER_SRC:-/scratch/$USER/dsv41-megamoe/aiter-vllm}"
 mori_package="${MORI_PACKAGE:-/scratch/$USER/dsv41-megamoe/pydeps-vllm/mori}"
-image_tag="${IMAGE_TAG:-dsv41-megamoe-adapter:vllm-e2944d9-aiter-22c8295-selector-r2}"
+image_tag="${IMAGE_TAG:-dsv41-megamoe-adapter:vllm-e2944d9-aiter-22c8295-async-r1}"
 
-expected_vllm="132d417f020c37d02a101bf06b410d4db1a27ae3"
+expected_vllm="acb139b8725a46e1747c163f3d57089ff8bffee4"
 expected_aiter="22c82955b41e2b482a99290537a044e6964499b1"
 expected_mori_so="3df6da1342f1c9dc7923fd2620bb132b283b2063bf0040a88cb08056e136cfd5"
 
@@ -23,6 +23,7 @@ vllm_files=(
     vllm/config/kernel.py
     vllm/distributed/device_communicators/all2all.py
     vllm/distributed/parallel_state.py
+    vllm/forward_context.py
     vllm/model_executor/layers/fused_moe/config.py
     vllm/model_executor/layers/fused_moe/layer.py
     vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py

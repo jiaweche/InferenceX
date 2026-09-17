@@ -1,9 +1,9 @@
 diff --git a/tests/model_executor/layers/test_aiter_mega_moe_v2.py b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
 new file mode 100644
-index 0000000..11561cd
+index 0000000..44866c1
 --- /dev/null
 +++ b/tests/model_executor/layers/test_aiter_mega_moe_v2.py
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,1037 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -17,12 +17,15 @@ index 0000000..11561cd
 +
 +from vllm.config import CUDAGraphMode, KernelConfig
 +from vllm.distributed.device_communicators.all2all import MoriAll2AllManager
-+from vllm.forward_context import ForwardContext
++from vllm.forward_context import ForwardContext, set_forward_context
 +from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 +from vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2 import (
 +    AiterMegaMoEV2Adapter,
 +    AiterMegaMoEV2Decision,
++    AiterMegaMoEV2PreparedSelection,
 +    _validate_static_configuration,
++    finish_aiter_mega_moe_v2_forward_context,
++    prepare_aiter_mega_moe_v2_forward_context,
 +    select_aiter_mega_moe_v2_local,
 +)
 +from vllm.model_executor.layers.fused_moe.config import (
@@ -438,6 +441,330 @@ index 0000000..11561cd
 +    assert not agreed
 +
 +
++class _FakeWork:
++    def __init__(self):
++        self.wait_calls = 0
++
++    def wait(self):
++        self.wait_calls += 1
++
++
++def test_mori_manager_async_selection_owns_buffers_and_waits_once(
++    monkeypatch,
++) -> None:
++    manager = _manager_for_selection_agreement()
++    works = []
++
++    def all_gather_into_tensor(output, local, *, group, async_op):
++        assert group is manager.cpu_group
++        assert async_op
++        output.copy_(local.repeat(manager.world_size))
++        work = _FakeWork()
++        works.append(work)
++        return work
++
++    monkeypatch.setattr(
++        "vllm.distributed.device_communicators.all2all.dist.all_gather_into_tensor",
++        all_gather_into_tensor,
++    )
++
++    first = manager.start_aiter_mega_moe_v2_selection(True, 16380)
++    second = manager.start_aiter_mega_moe_v2_selection(False, 16372)
++
++    assert first.local is not second.local
++    assert first.gathered is not second.gathered
++    assert manager.finish_aiter_mega_moe_v2_selection(first) == (True, True)
++    assert manager.finish_aiter_mega_moe_v2_selection(first) == (True, True)
++    assert manager.finish_aiter_mega_moe_v2_selection(second) == (False, True)
++    assert [work.wait_calls for work in works] == [1, 1]
++
++
++@pytest.mark.parametrize("disagreement_column", [0, 1])
++def test_mori_manager_async_selection_fails_closed(
++    monkeypatch,
++    disagreement_column: int,
++) -> None:
++    manager = _manager_for_selection_agreement()
++
++    def all_gather_into_tensor(output, local, *, group, async_op):
++        del group
++        assert async_op
++        output.copy_(local.repeat(manager.world_size))
++        output.view(manager.world_size, 2)[-1, disagreement_column] += 1
++        return _FakeWork()
++
++    monkeypatch.setattr(
++        "vllm.distributed.device_communicators.all2all.dist.all_gather_into_tensor",
++        all_gather_into_tensor,
++    )
++
++    agreement = manager.start_aiter_mega_moe_v2_selection(True, 16380)
++
++    assert manager.finish_aiter_mega_moe_v2_selection(agreement) == (False, False)
++
++
++class _FakePreparedSelectionManager:
++    def __init__(
++        self,
++        *,
++        prepared_result: tuple[bool, bool],
++        runtime_result: tuple[bool, bool] | None = None,
++    ):
++        self.prepared_result = prepared_result
++        self.runtime_result = runtime_result
++        self.finish_calls = 0
++        self.agree_calls = []
++
++    def finish_aiter_mega_moe_v2_selection(self, agreement):
++        assert agreement == "prepared"
++        self.finish_calls += 1
++        return self.prepared_result
++
++    def agree_aiter_mega_moe_v2_selection(self, eligible, raw_m):
++        self.agree_calls.append((eligible, raw_m))
++        if self.runtime_result is not None:
++            return self.runtime_result
++        return eligible, True
++
++
++def _adapter_for_selection() -> AiterMegaMoEV2Adapter:
++    adapter = object.__new__(AiterMegaMoEV2Adapter)
++    adapter.workspace_key = ("test",)
++    adapter.token_allowlist = _TOKEN_ALLOWLIST
++    return adapter
++
++
++class _FakeForwardContextSelectionManager:
++    def __init__(self):
++        self.start_calls = []
++        self.finish_calls = []
++
++    def start_aiter_mega_moe_v2_selection(self, eligible, raw_m):
++        self.start_calls.append((eligible, raw_m))
++        return "prepared"
++
++    def finish_aiter_mega_moe_v2_selection(self, agreement):
++        self.finish_calls.append(agreement)
++        return False, True
++
++
++def test_forward_context_starts_one_async_fallback_agreement(monkeypatch) -> None:
++    context = _context(_metadata(num_decodes=1, num_decode_tokens=6))
++    manager = _FakeForwardContextSelectionManager()
++    config = SimpleNamespace(
++        kernel_config=SimpleNamespace(
++            aiter_mega_moe_v2_token_allowlist=_TOKEN_ALLOWLIST
++        )
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_ep_all2all_manager",
++        lambda: manager,
++    )
++
++    prepare_aiter_mega_moe_v2_forward_context(context, 894, config)
++    prepare_aiter_mega_moe_v2_forward_context(context, 894, config)
++    finish_aiter_mega_moe_v2_forward_context(context)
++
++    assert manager.start_calls == [(False, 894)]
++    assert manager.finish_calls == ["prepared"]
++
++
++def test_forward_context_graph_selection_starts_no_collective(monkeypatch) -> None:
++    context = _context(graph_mode=CUDAGraphMode.FULL)
++    config = SimpleNamespace(
++        kernel_config=SimpleNamespace(
++            aiter_mega_moe_v2_token_allowlist=_TOKEN_ALLOWLIST
++        )
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_ep_all2all_manager",
++        lambda: pytest.fail("graph selection started a collective"),
++    )
++
++    prepare_aiter_mega_moe_v2_forward_context(context, 888, config)
++    finish_aiter_mega_moe_v2_forward_context(context)
++
++    prepared = context.additional_kwargs["aiter_mega_moe_v2_preselection"]
++    assert prepared.decision == AiterMegaMoEV2Decision(False, "cudagraph", 888)
++    assert prepared.agreement is None
++
++
++def test_set_forward_context_drains_async_selection_on_exception(monkeypatch) -> None:
++    calls = []
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            data_parallel_size=1,
++            use_sequence_parallel_moe=False,
++            is_moe_model=True,
++        ),
++        compilation_config=SimpleNamespace(
++            fast_moe_cold_start=False,
++            static_forward_context={},
++        ),
++        kernel_config=SimpleNamespace(enable_aiter_mega_moe_v2=True),
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "prepare_aiter_mega_moe_v2_forward_context",
++        lambda context, raw_m, vllm_config: calls.append(
++            ("prepare", context, raw_m, vllm_config)
++        ),
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "finish_aiter_mega_moe_v2_forward_context",
++        lambda context: calls.append(("finish", context)),
++    )
++
++    with (
++        pytest.raises(RuntimeError, match="forward failed"),
++        set_forward_context(None, config, num_tokens=888),
++    ):
++        raise RuntimeError("forward failed")
++
++    assert calls[0][0] == "prepare"
++    assert calls[0][2:] == (888, config)
++    assert calls[1] == ("finish", calls[0][1])
++
++
++def test_prepared_fallback_skips_runtime_validation_and_sync_agreement(
++    monkeypatch,
++) -> None:
++    context = _context(_metadata(num_decodes=1, num_decode_tokens=6))
++    context.additional_kwargs["aiter_mega_moe_v2_preselection"] = (
++        AiterMegaMoEV2PreparedSelection(
++            AiterMegaMoEV2Decision(False, "mixed", 894),
++            "prepared",
++        )
++    )
++    manager = _FakePreparedSelectionManager(prepared_result=(False, True))
++    adapter = _adapter_for_selection()
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "is_forward_context_available",
++        lambda: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_forward_context",
++        lambda: context,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_ep_all2all_manager",
++        lambda: manager,
++    )
++
++    first = adapter._select(
++        torch.empty((894, 1)),
++        lambda: pytest.fail("fallback validated runtime tensors"),
++    )
++    second = adapter._select(torch.empty((894, 1)))
++
++    assert first == second == AiterMegaMoEV2Decision(False, "mixed", 894)
++    assert manager.finish_calls == 1
++    assert manager.agree_calls == []
++
++
++def test_prepared_eligible_selection_agrees_runtime_before_caching(
++    monkeypatch,
++) -> None:
++    context = _context()
++    context.additional_kwargs["aiter_mega_moe_v2_preselection"] = (
++        AiterMegaMoEV2PreparedSelection(
++            AiterMegaMoEV2Decision(True, "eligible", 888),
++            "prepared",
++        )
++    )
++    manager = _FakePreparedSelectionManager(prepared_result=(True, True))
++    adapter = _adapter_for_selection()
++    runtime_calls = []
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "is_forward_context_available",
++        lambda: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_forward_context",
++        lambda: context,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_ep_all2all_manager",
++        lambda: manager,
++    )
++
++    first = adapter._select(
++        torch.empty((888, 1)),
++        lambda: runtime_calls.append(True),
++    )
++    second = adapter._select(torch.empty((888, 1)))
++
++    assert first.eligible and second.eligible
++    assert manager.finish_calls == 1
++    assert manager.agree_calls == [(True, 888)]
++    assert runtime_calls == [True]
++
++
++def test_prepared_selection_runtime_disagreement_fails_closed(monkeypatch) -> None:
++    context = _context()
++    context.additional_kwargs["aiter_mega_moe_v2_preselection"] = (
++        AiterMegaMoEV2PreparedSelection(
++            AiterMegaMoEV2Decision(True, "eligible", 888),
++            "prepared",
++        )
++    )
++    manager = _FakePreparedSelectionManager(
++        prepared_result=(True, True),
++        runtime_result=(False, False),
++    )
++    adapter = _adapter_for_selection()
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "is_forward_context_available",
++        lambda: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_forward_context",
++        lambda: context,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_ep_all2all_manager",
++        lambda: manager,
++    )
++
++    decision = adapter._select(torch.empty((888, 1)), lambda: None)
++
++    assert decision == AiterMegaMoEV2Decision(
++        False,
++        "rank_disagreement",
++        888,
++    )
++
++
++def test_adapter_records_fallback_once_per_context(monkeypatch) -> None:
++    context = _context()
++    records = []
++    manager = SimpleNamespace(
++        record_aiter_mega_moe_v2=lambda path, reason, raw_m, count: records.append(
++            (path, reason, raw_m, count)
++        )
++    )
++    adapter = _adapter_for_selection()
++    decision = AiterMegaMoEV2Decision(False, "mixed", 894)
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2."
++        "is_forward_context_available",
++        lambda: True,
++    )
++    monkeypatch.setattr(
++        "vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2.get_forward_context",
++        lambda: context,
++    )
++
++    adapter._record_path(manager, decision)
++    adapter._record_path(manager, decision)
++
++    assert records == [("ordinary", "mixed", 894, 40)]
++
++
 +def test_adapter_caches_one_rank_agreement(monkeypatch) -> None:
 +    context = _context()
 +    manager = _FakeSelectionManager()
@@ -514,7 +841,7 @@ index 0000000..11561cd
 +        lambda: manager,
 +    )
 +
-+    decision = adapter._select(torch.empty((888, 1)), "topk_ids")
++    decision = adapter._select(torch.empty((888, 1)), lambda: "topk_ids")
 +
 +    assert decision == AiterMegaMoEV2Decision(False, "topk_ids", 888)
 +    assert manager.calls == 1
@@ -564,7 +891,8 @@ index 0000000..11561cd
 +    ):
 +        self.registrations.append((key, error, factory, bind_workspace))
 +
-+    def record_aiter_mega_moe_v2(self, path, reason, raw_m):
++    def record_aiter_mega_moe_v2(self, path, reason, raw_m, count=1):
++        assert count == 1
 +        self.records.append((path, reason, raw_m))
 +
 +
@@ -720,16 +1048,16 @@ index a6dddc3..7083781 100644
 @@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
  from dataclasses import asdict, fields
  from typing import TYPE_CHECKING, Any, Literal
- 
+
 -from pydantic import Field, field_validator
 +from pydantic import Field, field_validator, model_validator
- 
+
  from vllm.config.utils import config, get_hash_factors, hash_factors
  from vllm.logger import init_logger
 @@ -267,6 +267,35 @@ class KernelConfig:
                     running QDQ on activations.
      """
- 
+
 +    enable_aiter_mega_moe_v2: bool = False
 +    """Enable the experimental ROCm AITER MegaMoEV2 path.
 +
@@ -761,11 +1089,11 @@ index a6dddc3..7083781 100644
 +
      linear_backend: LinearBackend = "auto"
      """Backend for linear layer GEMM kernels. Available options:
- 
+
 @@ -303,6 +332,54 @@ class KernelConfig:
              return value.lower().replace("-", "_")
          return value
- 
+
 +    @field_validator("aiter_mega_moe_v2_max_tokens")
 +    @classmethod
 +    def _validate_aiter_mega_moe_v2_max_tokens(cls, value: int) -> int:
@@ -818,18 +1146,40 @@ index a6dddc3..7083781 100644
      @classmethod
      def _normalize_linear_backend(cls, value: Any) -> Any:
 diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
-index eb187a9..59aba54 100644
+index eb187a9..e6a75f7 100644
 --- a/vllm/distributed/device_communicators/all2all.py
 +++ b/vllm/distributed/device_communicators/all2all.py
-@@ -6,6 +6,7 @@ from typing import Any
- 
+@@ -1,11 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import threading
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any
+
  import torch
  import torch.distributed as dist
 +from torch.distributed.distributed_c10d import _unregister_process_group
- 
+
  import vllm.envs as envs
  from vllm.config import get_current_vllm_config
-@@ -915,9 +916,151 @@ class MoriAll2AllManager(All2AllManagerBase):
+@@ -41,6 +42,15 @@ if has_flashinfer_nvlink_one_sided():
+ logger = init_logger(__name__)
+
+
++@dataclass
++class AiterMegaMoEV2SelectionAgreement:
++    local: torch.Tensor
++    gathered: torch.Tensor
++    work: Any
++    result: tuple[bool, bool] | None = None
++    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
++
++
+ class AgRsAll2AllManager(All2AllManagerBase):
+     """
+     An implementation of all2all communication based on
+@@ -915,9 +925,198 @@ class MoriAll2AllManager(All2AllManagerBase):
          super().__init__(cpu_group)
          self._all2all_backend = all2all_backend
          self.handle_cache = Cache()
@@ -848,7 +1198,7 @@ index eb187a9..59aba54 100644
 +            dtype=torch.int64,
 +            device="cpu",
 +        )
- 
+
          torch._C._distributed_c10d._register_process_group("mori", cpu_group)
          mori.shmem.shmem_torch_process_group_init("mori")
 +        self._mori_shmem_initialized = True
@@ -943,10 +1293,57 @@ index eb187a9..59aba54 100644
 +            )
 +            return agreed and bool(local[0].item()), agreed
 +
-+    def record_aiter_mega_moe_v2(self, path: str, reason: str, raw_m: int) -> None:
++    def start_aiter_mega_moe_v2_selection(
++        self,
++        eligible: bool,
++        raw_m: int,
++    ) -> AiterMegaMoEV2SelectionAgreement:
++        local = torch.tensor(
++            (int(eligible), raw_m),
++            dtype=torch.int64,
++            device="cpu",
++        )
++        gathered = torch.empty(
++            self.world_size * 2,
++            dtype=torch.int64,
++            device="cpu",
++        )
++        work = dist.all_gather_into_tensor(
++            gathered,
++            local,
++            group=self.cpu_group,
++            async_op=True,
++        )
++        return AiterMegaMoEV2SelectionAgreement(local, gathered, work)
++
++    def finish_aiter_mega_moe_v2_selection(
++        self,
++        agreement: AiterMegaMoEV2SelectionAgreement,
++    ) -> tuple[bool, bool]:
++        with agreement.lock:
++            if agreement.result is None:
++                agreement.work.wait()
++                agreed = torch.equal(
++                    agreement.gathered.view(self.world_size, 2),
++                    agreement.local.expand(self.world_size, 2),
++                )
++                agreement.result = (
++                    agreed and bool(agreement.local[0].item()),
++                    agreed,
++                )
++                agreement.work = None
++            return agreement.result
++
++    def record_aiter_mega_moe_v2(
++        self,
++        path: str,
++        reason: str,
++        raw_m: int,
++        count: int = 1,
++    ) -> None:
 +        key = (path, reason, raw_m)
 +        self._aiter_mega_moe_v2_counters[key] = (
-+            self._aiter_mega_moe_v2_counters.get(key, 0) + 1
++            self._aiter_mega_moe_v2_counters.get(key, 0) + count
 +        )
 +
 +    @property
@@ -978,7 +1375,7 @@ index eb187a9..59aba54 100644
 +                    finally:
 +                        _unregister_process_group("mori")
 +                        self._mori_shmem_initialized = False
- 
+
      def _make_all2all_kwargs(
          self,
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
@@ -1022,16 +1419,55 @@ index b24ff64..4f58d80 100644
          if enable_elastic_ep:
              _EP = _init_stateless_group(
                  group_ranks,
+diff --git a/vllm/forward_context.py b/vllm/forward_context.py
+index f57fc2c..b0c47ed 100644
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -339,9 +339,31 @@ def set_forward_context(
+         is_padding=is_padding,
+     )
+
++    use_aiter_mega_moe_v2 = (
++        vllm_config.kernel_config.enable_aiter_mega_moe_v2 and num_tokens is not None
++    )
++    if use_aiter_mega_moe_v2:
++        from vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2 import (
++            prepare_aiter_mega_moe_v2_forward_context,
++        )
++
++        prepare_aiter_mega_moe_v2_forward_context(
++            forward_context,
++            num_tokens,
++            vllm_config,
++        )
++
+     try:
+         with override_forward_context(forward_context):
+-            yield
++            try:
++                yield
++            finally:
++                if use_aiter_mega_moe_v2:
++                    from vllm.model_executor.layers.fused_moe.aiter_mega_moe_v2 import (
++                        finish_aiter_mega_moe_v2_forward_context,
++                    )
++
++                    finish_aiter_mega_moe_v2_forward_context(forward_context)
+     finally:
+         global last_logging_time, batchsize_logging_interval
+         if need_to_track_batchsize:
 diff --git a/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py b/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py
 new file mode 100644
-index 0000000..388ee03
+index 0000000..db5fce9
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/aiter_mega_moe_v2.py
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,419 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
++from collections.abc import Callable
 +from dataclasses import dataclass
++from typing import Any
 +
 +import torch
 +
@@ -1059,6 +1495,8 @@ index 0000000..388ee03
 +_TARGET_INTERMEDIATE = 2304
 +_TARGET_EP_SIZE = 4
 +_CACHE_PREFIX = "aiter_mega_moe_v2_selection"
++_PRESELECTION_KEY = "aiter_mega_moe_v2_preselection"
++_COUNTER_PREFIX = "aiter_mega_moe_v2_counter"
 +
 +
 +@dataclass(frozen=True)
@@ -1066,6 +1504,12 @@ index 0000000..388ee03
 +    eligible: bool
 +    reason: str
 +    raw_m: int
++
++
++@dataclass
++class AiterMegaMoEV2PreparedSelection:
++    decision: AiterMegaMoEV2Decision
++    agreement: Any | None
 +
 +
 +def _metadata_values(context: ForwardContext) -> list[DeepseekSparseSWAMetadata]:
@@ -1118,6 +1562,36 @@ index 0000000..388ee03
 +    if context.is_padding is not None and bool(context.is_padding.any().item()):
 +        return AiterMegaMoEV2Decision(False, "padding", raw_m)
 +    return AiterMegaMoEV2Decision(True, "eligible", raw_m)
++
++
++def prepare_aiter_mega_moe_v2_forward_context(
++    context: ForwardContext,
++    raw_m: int,
++    vllm_config: VllmConfig,
++) -> None:
++    if _PRESELECTION_KEY in context.additional_kwargs:
++        return
++    decision = select_aiter_mega_moe_v2_local(
++        context,
++        raw_m,
++        vllm_config.kernel_config.aiter_mega_moe_v2_token_allowlist,
++    )
++    agreement = None
++    if decision.reason not in ("stream_capture", "cudagraph"):
++        agreement = get_ep_all2all_manager().start_aiter_mega_moe_v2_selection(
++            decision.eligible,
++            raw_m,
++        )
++    context.additional_kwargs[_PRESELECTION_KEY] = AiterMegaMoEV2PreparedSelection(
++        decision,
++        agreement,
++    )
++
++
++def finish_aiter_mega_moe_v2_forward_context(context: ForwardContext) -> None:
++    prepared = context.additional_kwargs.get(_PRESELECTION_KEY)
++    if prepared is not None and prepared.agreement is not None:
++        get_ep_all2all_manager().finish_aiter_mega_moe_v2_selection(prepared.agreement)
 +
 +
 +def _is_target_geometry(moe: FusedMoEConfig) -> bool:
@@ -1292,7 +1766,7 @@ index 0000000..388ee03
 +    def _select(
 +        self,
 +        x: torch.Tensor,
-+        runtime_error: str | None = None,
++        runtime_error_factory: Callable[[], str | None] | None = None,
 +    ) -> AiterMegaMoEV2Decision:
 +        raw_m = int(x.shape[0])
 +        if not is_forward_context_available():
@@ -1305,17 +1779,49 @@ index 0000000..388ee03
 +                return AiterMegaMoEV2Decision(False, "cached_m_mismatch", raw_m)
 +            return cached
 +
-+        decision = select_aiter_mega_moe_v2_local(
-+            context,
-+            raw_m,
-+            self.token_allowlist,
-+        )
-+        if decision.reason == "stream_capture":
++        manager = get_ep_all2all_manager()
++        prepared = context.additional_kwargs.get(_PRESELECTION_KEY)
++        if prepared is not None:
++            decision = prepared.decision
++            if prepared.agreement is None:
++                eligible, agreed = decision.eligible, True
++            else:
++                eligible, agreed = manager.finish_aiter_mega_moe_v2_selection(
++                    prepared.agreement
++                )
++            if not agreed:
++                decision = AiterMegaMoEV2Decision(
++                    False,
++                    "rank_disagreement",
++                    raw_m,
++                )
++            elif decision.eligible != eligible:
++                decision = AiterMegaMoEV2Decision(False, "rank_ineligible", raw_m)
++            elif decision.raw_m != raw_m:
++                decision = AiterMegaMoEV2Decision(
++                    False,
++                    "cached_m_mismatch",
++                    raw_m,
++                )
++            if not eligible:
++                context.additional_kwargs[cache_key] = decision
++                return decision
++        else:
++            decision = select_aiter_mega_moe_v2_local(
++                context,
++                raw_m,
++                self.token_allowlist,
++            )
++        if decision.reason in ("stream_capture", "cudagraph"):
 +            context.additional_kwargs[cache_key] = decision
 +            return decision
-+        if decision.eligible and runtime_error is not None:
++        runtime_error = (
++            runtime_error_factory()
++            if decision.eligible and runtime_error_factory is not None
++            else None
++        )
++        if runtime_error is not None:
 +            decision = AiterMegaMoEV2Decision(False, runtime_error, raw_m)
-+        manager = get_ep_all2all_manager()
 +        eligible, agreed = manager.agree_aiter_mega_moe_v2_selection(
 +            decision.eligible,
 +            raw_m,
@@ -1327,6 +1833,22 @@ index 0000000..388ee03
 +        context.additional_kwargs[cache_key] = decision
 +        return decision
 +
++    def _record_path(self, manager, decision: AiterMegaMoEV2Decision) -> None:
++        count = 1
++        if is_forward_context_available():
++            context = get_forward_context()
++            counter_key = f"{_COUNTER_PREFIX}:{self.workspace_key}"
++            if counter_key in context.additional_kwargs:
++                return
++            context.additional_kwargs[counter_key] = True
++            count = 40
++        manager.record_aiter_mega_moe_v2(
++            "mega" if decision.eligible else "ordinary",
++            decision.reason,
++            decision.raw_m,
++            count,
++        )
++
 +    def maybe_apply(
 +        self,
 +        layer,
@@ -1334,20 +1856,18 @@ index 0000000..388ee03
 +        topk_weights: torch.Tensor,
 +        topk_ids: torch.Tensor,
 +    ) -> torch.Tensor | None:
-+        runtime_error = self._runtime_contract_error(
-+            layer,
++        decision = self._select(
 +            x,
-+            topk_weights,
-+            topk_ids,
++            lambda: self._runtime_contract_error(
++                layer,
++                x,
++                topk_weights,
++                topk_ids,
++            ),
 +        )
-+        decision = self._select(x, runtime_error)
 +        manager = get_ep_all2all_manager()
++        self._record_path(manager, decision)
 +        if not decision.eligible:
-+            manager.record_aiter_mega_moe_v2(
-+                "ordinary",
-+                decision.reason,
-+                decision.raw_m,
-+            )
 +            return None
 +        if self.workspace is None:
 +            raise RuntimeError("AITER MegaMoEV2 workspace was not preinitialized")
@@ -1360,11 +1880,6 @@ index 0000000..388ee03
 +            layer.w2_weight,
 +            layer.w2_weight_scale,
 +        )
-+        manager.record_aiter_mega_moe_v2(
-+            "mega",
-+            decision.reason,
-+            decision.raw_m,
-+        )
 +        return output
 diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
 index 8736b13..e74d690 100644
@@ -1375,7 +1890,7 @@ index 8736b13..e74d690 100644
      all2all_backend: str  # all2all backend for MoE communication
      enable_eplb: bool  # whether to enable expert load balancing
 +    force_all2all_kernels: bool = False
- 
+
      @property
      def is_sequence_parallel(self) -> bool:
 @@ -1059,7 +1060,10 @@ class FusedMoEParallelConfig:
@@ -1388,7 +1903,7 @@ index 8736b13..e74d690 100644
 +            or self.pcp_size > 1
 +            or self.is_sequence_parallel
          )
- 
+
      @property
 diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
 index 4b633dd..704fa03 100644
@@ -1402,9 +1917,9 @@ index 4b633dd..704fa03 100644
 +    moe_parallel_config.force_all2all_kernels = (
 +        kernel_config.force_mori_all2all or kernel_config.enable_aiter_mega_moe_v2
 +    )
- 
+
      assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
- 
+
 diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/mori.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/mori.py
 index fe3a539..98f524d 100644
 --- a/vllm/model_executor/layers/fused_moe/prepare_finalize/mori.py
@@ -1414,13 +1929,13 @@ index fe3a539..98f524d 100644
          self.max_tokens_per_rank = max_tokens_per_rank
          self.use_fp8_dispatch = use_fp8_dispatch
 +        self._source_topk_ids = None
- 
+
      @property
      def activation_format(self) -> mk.FusedMoEActivationFormat:
 @@ -86,6 +87,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                  quant_func = get_hip_quant(QuantType.per_Token)
                  a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
- 
+
 +        self._source_topk_ids = topk_ids
          (
              dispatch_a1,
@@ -1451,9 +1966,9 @@ index 33f6afa..812be2a 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -3,6 +3,7 @@
- 
+
  import torch
- 
+
 +from vllm.config import get_current_vllm_config
  from vllm.logger import init_logger
  from vllm.model_executor.layers.attention import Attention
@@ -1472,16 +1987,16 @@ index 33f6afa..812be2a 100644
 +                moe,
 +                self.mxfp4_backend,
 +            )
- 
+
      @property
      def supports_eplb(self) -> bool:
 @@ -802,6 +813,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
          w2_bias = getattr(layer, "w2_bias", None)
- 
+
          self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 +        if self.aiter_mega_moe_v2_adapter is not None:
 +            self.aiter_mega_moe_v2_adapter.validate_layer_weights(layer)
- 
+
      def get_fused_moe_quant_config(
          self,
 @@ -863,6 +876,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -1506,7 +2021,7 @@ index e129108..328971d 100644
 +++ b/vllm/model_executor/model_loader/utils.py
 @@ -12,7 +12,12 @@ from torch import nn
  from typing_extensions import assert_never
- 
+
  import vllm.envs as envs
 -from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 +from vllm.config import (
@@ -1521,7 +2036,7 @@ index e129108..328971d 100644
 @@ -144,6 +149,13 @@ def process_weights_after_loading(
              # the caching allocator, which starves the OS on UMA devices.
              release_device_memory_under_pressure(target_device)
- 
+
 +    if get_current_vllm_config().kernel_config.enable_aiter_mega_moe_v2:
 +        from vllm.model_executor.layers.fused_moe.all2all_utils import (
 +            get_ep_all2all_manager,
