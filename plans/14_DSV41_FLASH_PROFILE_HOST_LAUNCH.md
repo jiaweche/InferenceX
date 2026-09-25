@@ -6,7 +6,10 @@
 > §0, §3 and §5.
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **not started**
+Status: **stopped** by the operator on 2026-09-25 and replaced by Plan 16. It
+had been submitted to the Plan 11 executor mesh (setup in §8). One of its ten
+tasks was done (graph-launch counts from Plan 10's rank-0 captures); see
+`crusoe:/home/jiaweche/dsv41-profile-20260924/14_host_launch/CANCELLED.md`.
 
 > **Base changed (2026-09-24)** to `arbor-v2-plus-v6best-pr19` (Plan 09 §3).
 > The call sites in §2.2 were read at `93205f244`. Recheck them on the new base
@@ -155,3 +158,147 @@ crusoe:/home/jiaweche/dsv41-profile-20260924/14_host_launch/
 Persist the gap attribution, the microbenchmark with its reproducer, the HIP
 issue link, graph-launch counts, the knob diff, trace captures, per-replay bench
 outputs and the decision.
+
+## 8. Execution setup
+
+Written by the operator before submission. These are facts about the
+environment, not choices about the plan.
+
+### 8.1 Mesh, node and trees
+
+- **Mesh.** This plan runs on the mesh that executed Plans 11 and 13: session
+  `/home/jiaweche/Arbor-plan-executor-p11/sessions/plan-executor`, keeper
+  `arbor-p11-keeper` on `slog-007`. Both earlier plans settled with stop, and
+  both reviews are done.
+- **Node.** Job `174831` on `crsuse2-m2m-016` (`amd-burst`, 24 h, preemptible).
+  The pool adopts jobs named `arbor-p11-*`. All four job slots of the account
+  are in use.
+- **A fresh container.** At 20:46 UTC on 2026-09-25, `dsv41flash_arbor` was
+  recreated from the image by digest (`sha256:960228cf…`), and the fixed base
+  `be794db46` was overlaid again. The old container had held Plan 13's work, and
+  an orphaned vLLM server (four `VLLM::Worker_TP*` processes, started 19:29 UTC,
+  with its API server dead) was still holding GPUs 0–3 after Plan 13 settled.
+  **Stop every server you start before a task closes.**
+  - AITER is stock 0.1.21.post2, and its JIT caches start cold.
+  - Weights are node-local at
+    `/mnt/m2m_nobackup/jiaweche/inferencex-dsv41flash/models/DeepSeek-V4.1-Flash`.
+  - The aiperf client is at `/runtime/aiperf-src`.
+  - The setup log is `$R/logs/setup.log`.
+- **Other tenants' containers** (`miles_primus_yuankai`,
+  `oshkarav-inference-testing-amd-1`) sit on this node. Neither held a GPU at
+  setup. Record GPU occupancy before every measured stage, as Plan 09's
+  `measure_one.sh` does.
+- **Spur runs job steps in their own PID namespace.** Inside
+  `srun --overlap`, PID 1 is the job script, so host PIDs reported by
+  `amd-smi process` are not in `/proc`. Map them to containers with
+  `docker top <container> -eo pid,lstart,args`.
+- **Not ours.** Never touch these jobs, their containers, or their sessions.
+  Read-only access to their files is fine.
+
+  | Job | Node | Belongs to | Mesh runs on | Session |
+  | --- | --- | --- | --- | --- |
+  | `174800` | `m2m-032` | Plan 10 | `slog-005` | `/home/jiaweche/Arbor-plan-executor` |
+  | `174801` | `m2m-191` | Plan 12 | `slog-006` | `/home/jiaweche/Arbor-plan-executor-p12` |
+  | `174972` | `m2m-193` | Plan 15 | `slog-006` | `/home/jiaweche/Arbor-plan-executor-p15` |
+
+- **Paths.**
+  - Artifacts (§7): `R=/home/jiaweche/dsv41-profile-20260924/14_host_launch`.
+  - Base checkout: `/home/jiaweche/dsv41-merge/vllm-v6best-pr19`, a worktree of
+    `/home/jiaweche/dsv41-merge/vllm`. Do not commit on it.
+  - This plan's branch: make a new worktree from `be794db46`, for example
+    branch `arbor-v2-plus-v6best-pr19-p14` at
+    `/home/jiaweche/dsv41-merge/vllm-p14`.
+- **Deploying Python changes.** Run
+  `SRC=<worktree> WANT_SHA=<full sha> bash $R/bin/deploy_tree.sh` on the node.
+  It overlays `vllm/`, hash-checks every `.py` in the commit against the
+  container, confirms the compiled extensions are untouched, and imports the
+  DSA attention modules. Anything short of `DEPLOY_OK sha=<sha>` means the tree
+  is not what runs. §3 allows only host-side runtime changes, so no compiled
+  deploy should be needed.
+- **Server configuration.** The control server's env file (§3's
+  `VLLM_USE_BREAKABLE_CUDAGRAPH=1` comes from it) is `server_env_blind.list`
+  in the v9 toolbox named in §8.2, md5 `64a08abe4e522e6ba451e4b6bebdebcb`
+  (Plan 09 §3).
+- **MoE configs.** The base's PR #19 MoE-config install writes its CSV into the
+  AITER package inside the container, so every server after the first runs the
+  FlyDSL MoE configs. That is identical in both arms of every A/B here and must
+  stay so. Plan 09 owns it.
+- **GPUs.** A server runs TP4 on GPUs 0–3. GPUs 4–7 are idle, which is where
+  §4.3's isolated microbenchmark can run without disturbing a server.
+- **Other plans.** Plans 09, 11 and 15 are in
+  `/home/jiaweche/dsv41-profile-20260924/plans/`.
+
+### 8.2 Existing work to reuse
+
+- **Plan 15** runs on its own mesh (`slog-006`). Its §4.0 is capturing the base
+  at C8 and C32 on **all four ranks**, to measure allreduce arrival spread. It
+  hands host-gap findings to this plan (its §6). Its artifacts are
+  `/home/jiaweche/dsv41-profile-20260924/15_collectives_followup/`: read, never
+  write. If those four-rank captures exist when §4.1 starts, they record host
+  runtime calls on every rank. Captures compared against a candidate are
+  still taken on this node.
+- **Rank-0 captures of this base.**
+  - Plan 10's knob-off captures at C32 and C8, 400 `ProfilerStep#` each:
+    `/home/jiaweche/dsv41-profile-20260924/10_dsa_indexer_decode/run1/cap_base_c{32,8}/traces/`.
+  - Plan 09's captures:
+    `/home/jiaweche/dsv41-profile-20260924/09_moe_experts/run1/trace_a{0,1}_c{8,32}/traces/`.
+- **Plan 11's findings on the capture-time hazard** that §4.4 names: its
+  settlement, review and TODO are in `.../11_tp_allreduce/T09_SETTLEMENT.md`
+  and this mesh's session (`mesh/reviews/p01-reviewer.md`, `mesh/TODO.md`).
+- **Scripts.** Copy and change what differs:
+  - Plan 09 (`.../09_moe_experts/run1/bin/`): `capture_one.sh`,
+    `measure_one.sh` (one A/B point: fresh control server, marker check,
+    discarded warmup, one measured replay), `p09_driver.sh` and
+    `summarize_ab.py`.
+  - Plan 10 (`.../10_dsa_indexer_decode/run1/bin/`): `dsa_attrib.py` (Kineto
+    attribution, including graph-replayed kernels via the `correlation` of their
+    `hipGraphLaunch`) and `t01_driver.sh` (captures under a user unit).
+- **Harness.** Read, never edit; it belongs to another mesh's session:
+  `/home/jiaweche/Arbor-dsv41-mesh/sessions/megamoe-v9/mesh/toolbox/crusoe/{boot_control_server.sh,replay_arm.sh}`.
+- **The Ruby deep trace** behind §2 (and §4.1's "deep trace") is on `ruby-1`,
+  which Crusoe cannot reach, so §2's numbers are the reference, not a file.
+
+### 8.3 Things that have already cost time here
+
+- **What Plan 11's review found.** The reviewer upheld Plan 11's stop but
+  rejected several of its conclusions. Avoid repeating these:
+  - **A gate that was not run is "not run".** It is not "passed", even after a
+    stop makes it moot.
+  - **Keep the raw samples.** Keep each microbenchmark replay's samples, and
+    record the exact script that produced them.
+  - **Step counts come from `ProfilerStep#`.** Every capture here records 400.
+    Never infer them from median latency.
+  - **Timing overlap is not independence.** Two kernels not overlapping today
+    says nothing about whether one depends on the other.
+- **When a settled plan's work is done, it is done.** After Plan 13 settled,
+  this mesh's agents spent more than an hour messaging one another about its
+  records. Correct a settled record once, where it lives, and move on.
+- **Memory.** Parse traces on the node through
+  `srun --overlap --jobid=174831`, never on the login node.
+  - An agent that parsed a Kineto trace on a login node grew to 1.8 GB, and
+    every process of this user on that host slowed to a crawl.
+  - `slog-007` refused new logins on 2026-09-25 when its whole memory pool was
+    full. Processes already running there were unaffected.
+- **The login node kills your background processes.**
+  `/usr/local/sbin/shared-host-watch` SIGKILLs everything left in an ssh
+  session's scope about a minute after the session ends. Anything that must
+  outlive a command goes in a user unit:
+  `systemd-run --user --collect --unit=<name> bash -lc '<cmd>'`. Processes the
+  agents start inherit the keeper's unit.
+- **Broken Docker on some nodes.** `m2m-341` and `m2m-002` have Docker storage
+  that points at deleted directories, and `m2m-042` hung a smoke test. If this
+  node is preempted, test a replacement with `docker images` before
+  provisioning it.
+- **Scripts written from Windows** carry CRLF. A stray `\r` turned a successful
+  boot into exit 127.
+- **NFS lag.** The login node sees a `STATUS` file the node just wrote on
+  `/home` late. Retry, or read it through the node.
+- **Containers write only to node-local disk.** `/home` is NFS with
+  `root_squash`: write to `/mnt/m2m_nobackup` and copy durable results back.
+  `/home` is over 90% full.
+- **`pgrep -f` matches itself.** Inside `bash -lc "..."`, `pgrep -f` matches its
+  own command line. Use the `[m]easure_one` form.
+- **Heredocs.** A heredoc into `docker exec` needs `-i`.
+- **Liveness.** A driver that records `STATUS=RUNNING` and then dies looks
+  healthy. Check the pid or unit, not the status file.
+- **Seed.** The InferenceX mount hardcodes seed 42 (Plan 09 §5).

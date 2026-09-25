@@ -6,17 +6,28 @@
 > §0, §3 and §5.
 > This is an internal execution document, not published InferenceX documentation.
 
-Status: **submitted** to its own plan-executor mesh on 2026-09-25 (setup in §8)
+Status: **settled, stop** — 2026-09-25 13:48 UTC by its plan-executor mesh
+(setup in §8). Settlement:
+`crusoe:/home/jiaweche/dsv41-profile-20260924/11_tp_allreduce/T09_SETTLEMENT.md`.
+Successor: [Plan 15](./15_DSV41_FLASH_PROFILE_COLLECTIVES_FOLLOWUP.md)
 
 > **Base changed (2026-09-24)** to `arbor-v2-plus-v6best-pr19` (Plan 09 §3).
 > The code references below (fusion enablement, the one-stage cap) were read at
 > `93205f244`. Recheck them on the new base before execution.
 
+> **Premise corrected (2026-09-25).** The 3.8× B200 gap below compared
+> different batch sizes. At matched batch the decode allreduce is 1.6–1.7×
+> slower, and decode runs far below the 48 and 192 rows assumed in §2.1: 6–12
+> rows in a shallow C8 window and 42–72 in the deep C32 trace. Details in §2 and in
+> `agent/HANDOFF-dsv41-trace-analysis.md` §4.7 (jiaweichen-amd). The mesh
+> executing this plan works from its pinned copy and does not see this edit.
+
 ## 1. Objective
 
 Lower the per-call latency of the TP4 allreduce, above all the decode
-allreduce. That call is the clearest platform delta in the data, and none of
-the open kernel work touches it.
+allreduce. It is 15% of GPU kernel time, all on the critical path, and none of
+the open kernel work touches it. At matched batch it is 1.6–1.7× slower than
+B200's; the gap at C32's steady-state batch is not yet known.
 
 ## 2. Evidence
 
@@ -30,12 +41,28 @@ Collectives are **15.08%** of GPU kernel time, all of it on the critical path:
 | | prefill | 92 | 1638.9 | | 150.77 |
 | **total** | | **36,894** | | | **1674.65** |
 
-- **The gap is per call.** B200's C32 share is about the same, 15.93%, but its
-  decode allreduce (flashinfer `trtllm_mnnvl oneshotAllreduceFusionKernel`) has
-  a p50 of 5.1 µs against 19.5 µs here, 3.8× faster.
+- **The gap is per call, and it grows with batch.** B200's C32 share is about
+  the same, 15.93%. Its decode allreduce (flashinfer `trtllm_mnnvl
+  oneshotAllreduceFusionKernel`) has a p50 of 5.1 µs, but only over steps of
+  1–2 requests, which is all the B200 traces contain. The 19.5 µs here is over
+  steps of 7–12 requests. Matched by batch, on decode-only steps with 81
+  allreduces each:
+
+  | requests per step | rows | B200 p50 | MI355X p50 | MI355X kernel |
+  | ---: | ---: | ---: | ---: | --- |
+  | 1 | 6 | 4.7 µs | 7.4 µs | vLLM one-stage |
+  | 2 | 12 | 5.6 µs | 9.5 µs | AITER one-stage |
+  | 8 | 48 | not profiled | 14.2 µs | AITER two-stage |
+  | 10 | 60 | not profiled | 19.8 µs | AITER two-stage |
+
+  MI355X at 1–2 requests is Plan 09's knob-off C8 capture; at 8–10 requests it
+  is the deep C32 trace. So the gap is 1.57× and 1.70× where it can be
+  measured, and unknown at the batch C32 actually runs.
 - **Nothing overlaps.** `total_comm_time` equals `exposed_comm_time` to within
   0.06%, and the custom allreduce runs inline on the compute stream.
-- **`cross_device_reduce_1stage` never appears** in the deep run.
+- **`cross_device_reduce_1stage` never appears** in the deep run, whose steps
+  are all 7 requests or more. It carries every decode allreduce in the shallow
+  C8 capture, at 1–2 requests.
 - **Split the population before quoting a per-call cost.** The kernel is
   bimodal: decode and prefill differ by about 20×. An earlier "7× gap" came from
   a mean over both populations and was wrong.
@@ -60,9 +87,14 @@ At `93205f244`:
   (`vllm/distributed/device_communicators/aiter_custom_all_reduce.py`) admits
   the one-stage kernel only for at most 80 tokens **and** under 256 KB at TP ≤ 4.
   At hidden 5120 in bf16 a row is 10 KiB, so the cap is 25 rows.
-- C8 decode is 48 verify rows (480 KiB) and C32 decode is 192 rows (1.875 MiB).
-  Both take the two-stage variant. The function's own docstring says that
-  variant "is slower than an explicit `all_reduce` + norm".
+- 48 rows (C8) and 192 rows (C32) are the per-step **maxima**,
+  concurrency × (1 + 5 speculative tokens). Measured steps carry far fewer
+  requests: the shallow C8 capture runs 1–2 per step (6–12 rows, inside the
+  cap), and the deep C32 trace runs 7–12 (42–72 rows, 420–720 KiB). So the
+  one-stage cap binds at C32. In the C8 window measured so far one-stage
+  already runs; steady-state C8 crosses the 25-row cap only at 5 or more
+  requests per step, which has not been measured. The two-stage variant's own
+  docstring says it "is slower than an explicit `all_reduce` + norm".
 
 The 256 KB cap mirrors AITER's launcher contract
 (`csrc/include/custom_all_reduce.cuh`), so raising it may be an AITER change,
@@ -108,7 +140,8 @@ On one TP4 node, with graph capture, bench all four options against each other:
 
 Sweep hidden 5120 bf16 over 1–256 rows (decode) and 1K–16K rows (prefill).
 Report p50 and p99 per size. The question is whether one-stage beats two-stage
-at 48 rows and at 192 rows, and by how much.
+at 42–72 rows, the range C32 decode actually runs, and by how much. Report 48
+and 192 rows too, as the per-step maxima.
 
 ### 4.3 Candidates, one knob each, default off
 
@@ -130,7 +163,10 @@ block rejection for both arms.
 
 ## 5. Gates
 
-Kernel: A must beat the two-stage p50 (19.5 µs at C32) at both 48 and 192 rows.
+Kernel: A must beat the two-stage p50 across 42–72 rows (14.2 µs at 48 rows and
+19.8 µs at 60 in the deep trace). In the measured C8 window decode already runs
+one-stage, so A can move C8 only if steady-state C8 steps reach 5 or more
+requests.
 
 Trace, on a post-change capture:
 
